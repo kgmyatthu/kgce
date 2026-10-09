@@ -240,15 +240,21 @@ When several areas of one region touch the other half of a split, their border s
 
 ### Fixed theatre artwork (automatic) and optional painted override
 
-The frames of the original theatres (wooden border and parchment margin) are baked into the ETW supertexture; neither the ESF bounds nor the camera limits can move them. Every build therefore repairs, **without any project setting**, the supertexture and raw heights around America `[[-888,0],[-340,460]]` and India `[[440,-80],[790,300]]`. The native painter samples the user's ETW palette, texture and frame, uses real ETOPO elevation with the authored per-theatre calibration, moves the frame outward, and erases the old frame/vignette without stretching or moving already-playable land. The repaired footprint remains 598 America tiles and 466 India tiles over all seven mip levels. Europe's raw heights are unchanged; its shared frame seam with India and coarse DXT blocks straddling that seam can change.
+The frames of the original theatres (wooden border and parchment margin) are baked into the ETW supertexture; neither the ESF bounds nor the camera limits can move them. Every build therefore repairs, **without any project setting**, the supertexture and raw heights around America `[[-888,0],[-340,460]]` and India `[[440,-80],[790,300]]`. The native painter samples the user's ETW palette, texture and frame, uses real ETOPO elevation with the authored per-theatre calibration, moves the frame outward, and erases the old frame/vignette without stretching or moving already-playable land. The verified snapshot repairs 667 America tiles and 466 India tiles over all seven mip levels. Europe's raw heights are unchanged; its shared frame seam with India and coarse DXT blocks straddling that seam can change.
 
 `src/terrain/art/` performs the painting natively. `src/terrain/fixed_art.rs` caches the resulting sparse tiles and raw height runs under `workspace/derived/<fingerprint>/assets/terrain/fixed_art/`. Its manifest binds the recipe, fixed rectangles, original supertexture and heightmap hashes, public elevation data, and every generated file. Cache publication is atomic; invalid cache contents are regenerated from the snapshot. There are no embedded replacement-art ZIPs or Python runtime fallback. The only terrain-preparation developer tool retained is `tools/terrain_paint/prepare_dem.py`, which regenerates the shipped **public elevation data**, not game artwork.
 
 Heights are patched **before** the relief curve and the fog mask is derived from the patched, shaped heights, so coast, relief and fog agree with the new land. `terrain original` skips only the relief shaping: the result equals the patched raw heightmap exactly (the fixed terrain is still included); it is no longer the unchanged ETW heightmap.
 
+America's former interior edge is joined using a smooth source-minus-generated correction, rather than copying the nearest height or matching the dark parchment rim. The correction fades over 40 world units into generated land; original land is feathered over 20 units, excluding the first 8 units as reference material. Colour references also exclude black rock/underlay patches. Height blending preserves the land/sea mask. RGB-only repairs preserve the original DXT5 alpha blocks and artist-authored shoreline mip coverage instead of rebuilding them from colour changes; India's existing repaint policy is unchanged.
+
+Winter snow continues the source latitude profile westwards, with an elevation-dependent snowline from the patched **raw** heights, independent of the relief setting. Both winter snow DDS paths are updated, including their mip tails; summer is unchanged. The source's clipped northern strip east of the bounded feather is retained, with a smooth transition rather than changing all original America. Both America climate rasters now continue their own source categories by latitude and coastal/inland class, not India's climate IDs. Existing climate pixels, wind maps and theatre geometry are preserved.
+
+Older generated-art caches are automatically invalidated by the recipe version. Export again with the updated editor to regenerate the repair; no manual cache deletion or project edit is needed.
+
 `painted_terrain` (`terrain set --painted DIR|none`) remains an **optional advanced override**: when set, its supertexture, heightmap and fog mask are copied over the generated assets after validating sizes and tile grids, replacing the automatic art. It must match the fixed geometry and supply matching height and fog data.
 
-Independent comparison against the prior embedded build found the same 1,064 repaired tiles out of 10,922; all 9,858 untouched tiles are byte-identical and every alpha value is preserved. Native patched raw heights differ at three pixels by one byte value, with no sea/land flips; after default relief only one exported height pixel differs by one. America's fine texture differs because deterministic native patch selection resolves equal-score candidates differently from NumPy's unstable sorting: mean absolute RGB channel error is 0.970/255 across the repaired tiles and mip levels (India: 0.000025/255). Compressed tile bytes also differ with the zlib encoder. Decoded America and India images were inspected; the old thin land-tone join along the Western Plains edge remains a cosmetic limit. In-game appearance is **not verified**.
+The **initial native port, before the America continuity repair**, was independently compared against the prior embedded build: the same 1,064 repaired tiles out of 10,922; all 9,858 untouched tiles byte-identical and every alpha value preserved. Native patched raw heights differed at three pixels by one byte value, with no sea/land flips; after default relief only one exported height pixel differed by one. America's fine texture differed because deterministic native patch selection resolves equal-score candidates differently from NumPy's unstable sorting: mean absolute RGB channel error 0.970/255 across the repaired tiles and mip levels (India: 0.000025/255). Compressed tile bytes also differed with the zlib encoder. That comparison is historical, not a claim that the later continuity repair preserves the old seam.
 
 
 ### Verification state
@@ -310,16 +316,30 @@ Rust 1.94.1 was used. On this workstation, keep build and temporary files on F:
 ```powershell
 $env:CARGO_HOME = 'F:\NTW2\work\cargo-home'
 $env:CARGO_TARGET_DIR = 'F:\NTW2\kgc_port_editor\target'
+$env:CARGO_BUILD_JOBS = '1'
 $env:TEMP = $env:TMP = 'F:\NTW2\work\tmp'
-cargo test --release --locked -j1
+cargo clippy --release --locked --all-targets
+cargo test --release --locked --all-targets
 cargo build --release --locked -j1
 ```
 
 The executable is `target/release/KgcPortEditor.exe`. Ship it with `assets/` from this source tree; do not include local workspaces or generated resources. The source-only release build requires the two community schemas and `assets/policy/` (including public DEM binaries), but no game installation or derived game assets. `-j1` avoids concurrent LLVM release compilation exhausting memory on this workstation. The application is entirely native Rust; RPFM is only needed by the user to prepare modded TSV exports. Python, NumPy and SciPy are optional developer dependencies only for regenerating the public DEM files.
 
+`.github/workflows/pr.yml` runs independent **clippy (Windows)** and **test (Windows)** checks on every pull request and push to `main`, using Rust 1.94.1, locked dependencies and all Cargo targets. Clippy uses its default lint levels: errors fail the check, while existing style warnings remain visible and non-blocking. The workflow uses read-only repository permissions, commit-pinned actions and dependency caching; only pushes to `main` save the cache. Neither check requires game installations or a local workspace.
+
 Release builds retain optimization level 3, but disable cross-crate LTO, use 16 code-generation units and enable incremental compilation. Keep the same Cargo home/target directory between edits so artifacts can be reused. A clean build or a profile/toolchain change must rebuild dependencies once. For type checking without producing an executable, use `cargo check --release --locked`.
 
 On this workstation the one-time profile/dependency rebuild compiled in 49.34 seconds. A subsequent real source-edit release rebuild completed in 9.69 seconds. These are observed local timings, not guarantees for other machines.
+
+## Verification performed for western America continuity
+
+- **285 release tests passed** (283 library, 2 CLI), including damaged-rim/slope continuity, exclusion of invalid colour references, snow mip tails, latitude/coast climate continuation, and colour-only versus coverage-only edits across all seven supertexture mip levels.
+- A full native CLI export succeeded from an isolated copy of the current 138-region project. Recipe changes regenerated the previous cache; a subsequent cached export also succeeded. Decoded colour, hillshade and winter-mask images were inspected.
+- The 198,323-pixel land boundary sample's 95th-percentile height gradient fell from **4.03 to 2.55**; the 99th percentile fell from **6.02 to 3.91**. There were **zero land/sea height-mask changes** across the entire map.
+- Compared with the previous native export, 378 texture tiles changed, all inside America's tile ancestry; **10,544 tiles are byte-identical**, including India. The file set is unchanged. Changed game files are limited to the supertexture pair, heightmap, fog mask, two winter DDS files and `regions.esf`.
+- Winter's old 0-to-255 cutoff was replaced by a bounded feather: the maximum adjacent-pixel snow-mask step in the measured join fell from **255 to 49**. Summer, winter DDS headers and all winter-mask alpha blocks remain unchanged.
+- Independently decoded America climate rasters preserve every original cell and use source-valid land/coast/ocean IDs. Both match across **99.91%** of the old boundary; the remaining differences are actual land/coast class boundaries. All other `regions.esf` records, including winds, theatre geometry and other theatres, match the prior export.
+- All work stayed on F:, without installing the generated campaign or launching the game. These are exported-data and decoded-image checks, **not in-game rendering or gameplay verification**.
 
 ## Verification performed for native local rebuilding
 

@@ -7,7 +7,8 @@
 //! * [`import_painted_terrain`]: copy a painted supertexture / heightmap / fogmask (see `tools/terrain_paint`) over
 //!   the generated `display/` assets after validating sizes and formats.
 //!
-//! Rules are those of `work/exp3/exp3_india_big.py` (`recanvas`, `climate_fill`, `tga_recanvas`).
+//! Rules are those of `work/exp3/exp3_india_big.py` (`recanvas`, `climate_fill`, `tga_recanvas`); only America's
+//! climate rasters continue their own categories at the same latitude instead of using India's thresholds.
 
 use std::{
     fs,
@@ -17,7 +18,10 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 
-use super::formats as F;
+use super::{
+    art::{grid::Arr2, prims},
+    formats as F,
+};
 use crate::{
     esf::{self, Node, Value},
     regionmap::{
@@ -232,6 +236,172 @@ impl<'a> LandLocator<'a> {
     }
 }
 
+/// How the climate pixels outside the old canvas are chosen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClimateFill {
+    /// exp3's rule, kept for India and every theatre other than America: land north of y = 250 is 1, other land 7,
+    /// everything else 34.
+    Thresholds,
+    /// America: the categories of the source raster continue outward (see [`continue_categories`]).
+    Continuation,
+}
+
+impl ClimateFill {
+    fn for_theatre(theatre: &str) -> Self {
+        if theatre_stem(theatre) == Some("america") { Self::Continuation } else { Self::Thresholds }
+    }
+}
+
+/// Width in climate pixels (about 14 world units) of the coastal band America's climate rasters treat apart from
+/// the rest of the land and sea. Measured on the source rasters (1025x1123, land = region polygons): in the land
+/// raster the open-sea marker 34 never lies within 18 px of land and covers 97% of the sea beyond 34 px, while the
+/// sea within 20 px of land carries a land category (99.98%); in the sea raster the land farther than 34 px from
+/// water is one single category (98%+) and the band around a coast holds that latitude's coastal categories.
+const COASTAL_BAND_PX: f64 = 34.0;
+
+/// Land flag (centre of the pixel inside a land region) of the pixels of the new canvas a fill needs: the pixels
+/// outside the old raster, or with `whole` all of them. Other entries are `false`.
+fn land_mask(cv: &Canvas, locator: &LandLocator, whole: bool) -> Vec<bool> {
+    let mut mask = vec![false; cv.nw * cv.nh];
+    for py in 0..cv.nh {
+        let mut scan = None;
+        for px in 0..cv.nw {
+            if !whole && cv.source(px, py).is_some() {
+                continue;
+            }
+            let scan = scan.get_or_insert_with(|| locator.scanline(cv.world(0, py)[1]));
+            mask[py * cv.nw + px] = locator.is_land(scan, cv.world(px, py)[0]);
+        }
+    }
+    mask
+}
+
+const LAND_NEAR: u8 = 0;
+const LAND_FAR: u8 = 1;
+const SEA_NEAR: u8 = 2;
+const SEA_FAR: u8 = 3;
+
+/// Land / sea and within / beyond `band` pixels of the opposite kind, for every pixel of the new canvas.
+fn coast_classes(cv: &Canvas, land: &[bool], band: f64) -> Vec<u8> {
+    let on_land = Arr2::from_vec(cv.nh, cv.nw, land.to_vec());
+    let on_sea = Arr2::from_vec(cv.nh, cv.nw, land.iter().map(|l| !l).collect());
+    // a land pixel's distance to the nearest sea pixel, a sea pixel's distance to the nearest land pixel
+    let (to_sea, to_land) = (prims::edt(&on_land), prims::edt(&on_sea));
+    let band = band as f32;
+    (0..land.len())
+        .map(|i| match (land[i], (if land[i] { to_sea.d[i] } else { to_land.d[i] }) <= band) {
+            (true, true) => LAND_NEAR,
+            (true, false) => LAND_FAR,
+            (false, true) => SEA_NEAR,
+            (false, false) => SEA_FAR,
+        })
+        .collect()
+}
+
+/// The pixels of one kind of the old raster, row by row, for "same latitude" lookups.
+struct RowCells {
+    /// ascending x of the matching pixels of every old row
+    xs: Vec<Vec<usize>>,
+    /// the closest old row (the lower one on a tie) that has any
+    nearest_row: Vec<Option<usize>>,
+}
+
+impl RowCells {
+    fn new(cv: &Canvas, classes: &[u8], keep: impl Fn(u8) -> bool) -> Self {
+        let class_at = |x: usize, y: usize| classes[(y as i64 + cv.oy) as usize * cv.nw + (x as i64 + cv.ox) as usize];
+        let xs: Vec<Vec<usize>> = (0..cv.h).map(|y| (0..cv.w).filter(|&x| keep(class_at(x, y))).collect()).collect();
+        let mut nearest_row = vec![None; cv.h];
+        let mut gap = vec![usize::MAX; cv.h];
+        let mut last = None;
+        for y in 0..cv.h {
+            if !xs[y].is_empty() {
+                last = Some(y);
+            }
+            if let Some(l) = last {
+                (nearest_row[y], gap[y]) = (Some(l), y - l);
+            }
+        }
+        let mut last = None;
+        for y in (0..cv.h).rev() {
+            if !xs[y].is_empty() {
+                last = Some(y);
+            }
+            if let Some(l) = last.filter(|l| l - y < gap[y]) {
+                (nearest_row[y], gap[y]) = (Some(l), l - y);
+            }
+        }
+        Self { xs, nearest_row }
+    }
+
+    /// The matching pixel of the closest row with any, nearest to column `qx`.
+    fn pick(&self, qx: usize, qy: usize) -> Option<(usize, usize)> {
+        let row = self.nearest_row[qy]?;
+        let xs = &self.xs[row];
+        let at = xs.partition_point(|&x| x < qx);
+        let x = match (at.checked_sub(1).map(|i| xs[i]), xs.get(at).copied()) {
+            (Some(a), Some(b)) => if qx - a <= b - qx { a } else { b },
+            (Some(x), None) | (None, Some(x)) => x,
+            (None, None) => return None,
+        };
+        Some((x, row))
+    }
+}
+
+/// Marks a pixel of the new canvas that lies on the old raster (it keeps its own category).
+const NO_SOURCE: u32 = u32::MAX;
+
+/// Which old pixel every new climate pixel of the canvas copies its category from (flat index into the old raster,
+/// [`NO_SOURCE`] for pixels on the old raster). Depends only on the geometry, so both America rasters share it.
+/// Category ids are never mixed, averaged or invented: a new pixel is taken at its own latitude (the closest old row
+/// that has one) and nearest to the edge it continues, from old pixels of the same kind:
+/// * land beyond [`COASTAL_BAND_PX`] of the water: land pixels of that kind, so the interior zones keep going (an
+///   inland pixel more than one band away is another zone and not used: lakes at the edge would otherwise
+///   drag a distant zone to the edge); land within the band: any land pixel, so the zones meeting the edge
+///   continue to the coast;
+/// * sea within the band of land: sea pixels within the band (the coastal / shelf categories of that latitude);
+/// * open sea: open-sea pixels (the ocean zone of that latitude).
+/// The other kind of the same side is the fallback. A new land (sea) pixel with no land (sea) pixel anywhere on the
+/// old raster is an error. `land` is [`land_mask`] over the whole new canvas.
+fn continuation_sources(cv: &Canvas, land: &[bool], band: f64) -> Result<Vec<u32>> {
+    let classes = coast_classes(cv, land, band);
+    let land_any = RowCells::new(cv, &classes, |c| c == LAND_NEAR || c == LAND_FAR);
+    let land_far = RowCells::new(cv, &classes, |c| c == LAND_FAR);
+    let sea_near = RowCells::new(cv, &classes, |c| c == SEA_NEAR);
+    let sea_far = RowCells::new(cv, &classes, |c| c == SEA_FAR);
+    let mut sources = vec![NO_SOURCE; cv.nw * cv.nh];
+    for py in 0..cv.nh {
+        for px in 0..cv.nw {
+            if cv.source(px, py).is_some() {
+                continue;
+            }
+            let qx = (px as i64 - cv.ox).clamp(0, cv.w as i64 - 1) as usize;
+            let qy = (py as i64 - cv.oy).clamp(0, cv.h as i64 - 1) as usize;
+            let (first, reach, second) = match classes[py * cv.nw + px] {
+                LAND_NEAR => (&land_any, f64::INFINITY, &land_any),
+                LAND_FAR => (&land_far, band, &land_any),
+                SEA_NEAR => (&sea_near, f64::INFINITY, &sea_far),
+                _ => (&sea_far, f64::INFINITY, &sea_near),
+            };
+            let near_enough = |&(sx, sy): &(usize, usize)| (sx as f64 - qx as f64).hypot(sy as f64 - qy as f64) <= reach;
+            let (sx, sy) = first.pick(qx, qy).filter(near_enough).or_else(|| second.pick(qx, qy)).with_context(|| {
+                let kind = if land[py * cv.nw + px] { "land" } else { "sea" };
+                format!("the new {kind} climate pixel ({px}, {py}) has no {kind} pixel on the old raster to continue")
+            })?;
+            sources[py * cv.nw + px] = (sy * cv.w + sx) as u32;
+        }
+    }
+    Ok(sources)
+}
+
+/// Writes the new pixels of a climate raster from `data` through [`continuation_sources`]; old pixels stay.
+fn continue_categories(sources: &[u32], data: &[u8], out: &mut [u8]) {
+    for (px, &s) in out.iter_mut().zip(sources) {
+        if s != NO_SOURCE {
+            *px = data[s as usize];
+        }
+    }
+}
+
 // ------------------------------------------------------------------------------------------ canvases
 
 /// Raster sizes written by [`extend_canvases`].
@@ -263,9 +433,12 @@ fn set_array(node: &mut Node, data: Vec<u8>) -> Result<()> {
 
 /// Extend the climate and wind canvases of theatre `theatre` (regions.esf key, e.g. `"3"`) in
 /// `<map_dir>/regions.esf` from `old_rect` to `new_rect`:
-/// * `climate_map` records: 1 byte per pixel, new pixels get the climate of the point (land north of y = 250: 1,
-///   other land: 7, sea or outside every region: 34; land = the innermost region polygon at the pixel centre, taken
-///   from the file's own geometry, so call this BEFORE regions are clipped / activated);
+/// * `climate_map` records (America has a land-climate raster and a sea-climate raster, each extended on its own):
+///   old pixels are copied; new pixels of America continue the categories of the raster at the same latitude, split
+///   into land / coastal sea / open sea (see [`continue_categories`]); every other theatre gets the exp3 policy (land
+///   north of y = 250: 1, other land: 7, sea or outside every region: 34).
+///   Land = the innermost region polygon at the pixel centre, taken from the file's
+///   own geometry, so call this BEFORE regions are clipped / activated;
 /// * `wind_map`: 2 bytes per pixel, new pixels take the nearest existing pixel.
 /// Pixels per world unit stay as they were (about 2.44 for climate, 0.4 for wind), sizes are rounded half-to-even.
 /// The theatre rectangle itself is not touched (that is `RegionData::extend_theatre`); the file is rewritten in
@@ -293,6 +466,7 @@ pub fn extend_canvases_in(root: &mut Node, theatre: &str, old_rect: Rect, new_re
     let record = &mut root.get_mut("theatres")?.items_mut()?[index][0];
     let mut sizes = CanvasSizes { climate: (0, 0), wind: (0, 0) };
     let mut winds = 0;
+    let mut continuation: Option<((usize, usize), Vec<u32>)> = None;
     for child in record.children_mut()? {
         match child.name() {
             Some("climate_map") => {
@@ -302,16 +476,25 @@ pub fn extend_canvases_in(root: &mut Node, theatre: &str, old_rect: Rect, new_re
                 ensure!(data.len() == w * h, "climate_map holds {} bytes for {w}x{h}", data.len());
                 let cv = Canvas::new(w, h, old_rect, new_rect)?;
                 let mut out = cv.build(data, 1, false);
-                for py in 0..cv.nh {
-                    if (0..cv.nw).all(|px| cv.source(px, py).is_some()) {
-                        continue;
-                    }
-                    let scan = locator.scanline(cv.world(0, py)[1]);
-                    for px in 0..cv.nw {
-                        if cv.source(px, py).is_none() {
-                            let [wx, wy] = cv.world(px, py);
-                            out[py * cv.nw + px] = if locator.is_land(&scan, wx) { if wy > 250.0 { 1 } else { 7 } } else { 34 };
+                match ClimateFill::for_theatre(theatre) {
+                    ClimateFill::Thresholds => {
+                        let land = land_mask(&cv, &locator, false);
+                        for py in 0..cv.nh {
+                            for px in 0..cv.nw {
+                                if cv.source(px, py).is_none() {
+                                    out[py * cv.nw + px] = if land[py * cv.nw + px] { if cv.world(px, py)[1] > 250.0 { 1 } else { 7 } } else { 34 };
+                                }
+                            }
                         }
+                    }
+                    ClimateFill::Continuation => {
+                        if continuation.as_ref().is_none_or(|(dims, _)| *dims != (cv.w, cv.h)) {
+                            let land = land_mask(&cv, &locator, true);
+                            let sources = continuation_sources(&cv, &land, COASTAL_BAND_PX)
+                                .with_context(|| format!("Theatre {theatre}: continue the climate_map categories"))?;
+                            continuation = Some(((cv.w, cv.h), sources));
+                        }
+                        continue_categories(&continuation.as_ref().expect("filled above").1, data, &mut out);
                     }
                 }
                 set_u32(&mut ch[0], cv.nw)?;
@@ -613,6 +796,71 @@ mod tests {
     #[test]
     fn python_rounding_is_half_even() {
         assert_eq!([py_round(0.5), py_round(1.5), py_round(2.5), py_round(-0.5), py_round(2.4), py_round(2.6)], [0, 2, 2, 0, 2, 3]);
+    }
+
+    #[test]
+    fn new_climate_pixels_continue_their_latitude_and_coast() {
+        // 8x6 raster, one pixel per unit, growing four units to the west; band of 2 pixels. Land east of x = 6 from
+        // row 3 up, plus two one-row islands in the new area (rows 0 and 5). Every old pixel is given the category
+        // of its kind: land near water 40, land inland 41, coastal sea 20 + row, open sea 30 + row.
+        let cv = Canvas::new(8, 6, [[0.0, 0.0], [8.0, 6.0]], [[-4.0, 0.0], [8.0, 6.0]]).unwrap();
+        assert_eq!((cv.nw, cv.nh, cv.ox, cv.oy), (12, 6, 4, 0));
+        let land: Vec<bool> = (0..cv.nw * cv.nh)
+            .map(|i| {
+                let (px, py) = (i % cv.nw, i / cv.nw);
+                (px >= 6 && py >= 3) || (px <= 1 && (py == 5 || py == 0))
+            })
+            .collect();
+        let classes = coast_classes(&cv, &land, 2.0);
+        let data: Vec<u8> = (0..cv.w * cv.h)
+            .map(|i| {
+                let (x, y) = (i % cv.w, i / cv.w);
+                match classes[y * cv.nw + x + 4] {
+                    LAND_NEAR => 40,
+                    LAND_FAR => 41,
+                    SEA_NEAR => 20 + y as u8,
+                    _ => 30 + y as u8,
+                }
+            })
+            .collect();
+        let mut out = cv.build(&data, 1, false);
+        continue_categories(&continuation_sources(&cv, &land, 2.0).unwrap(), &data, &mut out);
+        let at = |px: usize, py: usize| out[py * cv.nw + px];
+        // old content is untouched
+        for y in 0..cv.h {
+            assert_eq!(out[y * cv.nw + 4..(y + 1) * cv.nw], data[y * cv.w..(y + 1) * cv.w], "old row {y}");
+        }
+        // new land takes land categories, never a coastal sea category
+        for (px, py) in [(0, 5), (1, 5), (0, 0), (1, 0)] {
+            assert_eq!(at(px, py), 40, "island pixel {px},{py}");
+        }
+        // new sea beside an island takes the coastal category of its latitude
+        assert_eq!([at(3, 5), at(0, 4)], [25, 24]);
+        // open sea takes the ocean category of its latitude, or of the closest latitude that has any
+        assert_eq!(at(3, 3), 32);
+        // old row 0 is all open sea (the nearest land is three pixels away), so coastal sea beside the island there
+        // takes the closest latitude that has a coastal pixel: old row 1 (21), not the farther row 2 (22); the
+        // coastal sea at row 1 itself takes its own latitude
+        assert_eq!([at(2, 0), at(1, 1)], [21, 21]);
+        // sea never receives a land category
+        for py in 0..cv.nh {
+            for px in 0..4 {
+                if !land[py * cv.nw + px] {
+                    assert!(![40, 41].contains(&at(px, py)), "sea pixel {px},{py}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_pixel_needs_a_reference_of_its_own_side() {
+        // the old raster is all sea: new sea continues, a new island has no land to take its category from
+        let cv = Canvas::new(4, 4, [[0.0, 0.0], [4.0, 4.0]], [[-2.0, 0.0], [4.0, 4.0]]).unwrap();
+        let mut land = vec![false; cv.nw * cv.nh];
+        assert!(continuation_sources(&cv, &land, 1.0).is_ok());
+        land[3 * cv.nw] = true;
+        let err = continuation_sources(&cv, &land, 1.0).unwrap_err().to_string();
+        assert!(err.contains("new land climate pixel (0, 3)"), "{err}");
     }
 
     #[test]

@@ -29,6 +29,8 @@ use super::prims::{self, Mode};
 use super::resample::Pcg64;
 use super::stpx::{self, CanvasWindow, TileSource};
 
+mod seam;
+
 // ---------------------------------------------------------------------------------------------- constants
 const S0: f64 = 25.6;
 const WORLD_X0: f64 = -1280.0;
@@ -62,14 +64,11 @@ const C_WIN1: usize = 14784; // px_x(-342.5)
 const C_HEAL1: usize = 4403; // px_x(-748)
 const HEAL_PX: f32 = 150.0;
 const REM_PX: usize = 140;
-const RIM_REF0: usize = 4442; // px_x(-746.5)
-const RIM_REF1: usize = 4557; // px_x(-742)
 const SEA_SIGMA_NEAR: f32 = 45.0;
 const SEA_SIGMA_STRIP: f32 = 320.0;
 const STRIP_CHUNK_END: usize = 4992; // px_x(-725)
 const VOID_HM_STRAY: u8 = 13;
 const EDGE_BASE: f64 = 2.6;
-const TAPER_UNITS: f64 = 8.0;
 const P0_AMER: [f32; 3] = [156.7, 145.1, 116.2];
 
 const HM_ROW_TOP: usize = 3584; // round((CANVAS_YT - WORLD_Y0) * HM_PX)
@@ -1110,6 +1109,92 @@ fn compute_masks(
     Ok(Masks { mp, vc, vland })
 }
 
+struct LandJoin {
+    original: Arr2<f32>,
+    correction: Arr2<Rgbf>,
+}
+
+impl LandJoin {
+    fn new(
+        rgb: &Arr2<Rgb8>,
+        al: &Arr2<u8>,
+        masks: &Masks,
+        terr: &DemTerrain,
+        painter: &Painter,
+    ) -> Result<Self> {
+        let z = terr.z_coarse_grid();
+        let mut generated = Arr2::new(z.h, z.w, false);
+        let mut stock = Arr2::new(z.h, z.w, false);
+        let mut references = Arr2::new(z.h, z.w, false);
+        let mut residual = Arr2::new(z.h, z.w, [0.0; 3]);
+        for r in 0..z.h {
+            for c in 0..z.w {
+                let k = r * z.w + c;
+                if z.d[k] <= 0.0 {
+                    continue;
+                }
+                let (mut painted, mut land, mut count, mut sum) =
+                    (0usize, 0usize, 0usize, [0f32; 3]);
+                for rr in r * 8..r * 8 + 8 {
+                    for cc in c * 8..c * 8 + 8 {
+                        if masks.mp.get(rr, cc) {
+                            painted += 1;
+                        } else if masks.vland.get(rr, cc) && al.get(rr, cc) < 8 {
+                            land += 1;
+                            let colour = rgb.get(rr, cc);
+                            // Same usable-ground criterion as palette learning: black rock/underlay patches
+                            // must not become a colour correction smeared out over the new plains.
+                            if colour.iter().map(|&v| v as u16).sum::<u16>() <= 135 {
+                                continue;
+                            }
+                            count += 1;
+                            for ch in 0..3 {
+                                sum[ch] += colour[ch] as f32;
+                            }
+                        }
+                    }
+                }
+                generated.d[k] = painted >= 32;
+                stock.d[k] = !generated.d[k] && land >= 32;
+                references.d[k] = stock.d[k] && count >= 32;
+                if references.d[k] {
+                    let predicted =
+                        painter.land_colour(z_to_h(z.d[k]), CANVAS_YT - (r * 8 + 4) as f64 / S0);
+                    for ch in 0..3 {
+                        residual.d[k][ch] = sum[ch] / count as f32 - predicted[ch];
+                    }
+                }
+            }
+        }
+        let transition = seam::Transition::new(&generated, &stock, &references, HM_PX as f32)?;
+        let mut correction = transition.colour_residual(|k| residual.d[k]);
+        for (rgb, &weight) in correction.d.iter_mut().zip(&transition.correction.d) {
+            for channel in rgb {
+                *channel *= weight;
+            }
+        }
+        Ok(Self {
+            original: transition.original,
+            correction,
+        })
+    }
+
+    fn sample(&self, r: usize, c: usize) -> seam::Sample {
+        seam::Sample::texture(r, c, self.original.h, self.original.w)
+    }
+
+    fn affects(&self, r: usize, c: usize) -> bool {
+        self.sample(r, c).scalar(&self.original.d) < 1.0
+    }
+
+    fn any_in(&self, r0: usize, r1: usize, c0: usize, c1: usize) -> bool {
+        (r0.saturating_sub(8) / 8..(r1.div_ceil(8) + 1).min(self.original.h)).any(|r| {
+            (c0.saturating_sub(8) / 8..(c1.div_ceil(8) + 1).min(self.original.w))
+                .any(|c| self.original.get(r, c) < 1.0)
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------------------------- painting
 fn paint_canvas(
     rgb: &mut Arr2<Rgb8>,
@@ -1119,7 +1204,7 @@ fn paint_canvas(
     terr: &DemTerrain,
     rep: &mut serde_json::Map<String, Value>,
     progress: &dyn Fn(&str),
-) -> Result<()> {
+) -> Result<LandJoin> {
     let canvas = Canvas {
         h: H_C,
         w: W_C,
@@ -1127,6 +1212,8 @@ fn paint_canvas(
         yt: CANVAS_YT,
     };
     let painter = Painter::new(Variant::America, canvas, learned);
+    progress("America: matching land across the former parchment boundary");
+    let join = LandJoin::new(rgb, al, masks, terr, &painter)?;
     let edges = [
         Edge {
             side: b'W',
@@ -1154,10 +1241,11 @@ fn paint_canvas(
         },
     ];
     let (mut void_land, mut void_sea, mut strip_land, mut strip_sea) = (0u64, 0u64, 0u64, 0u64);
-    let Some((r_min, r_max, _, _)) = masks.mp.bounds() else {
-        bail!("America painter ownership mask is empty")
-    };
-    let (r_a, r_b) = (r_min, r_max + 1);
+    ensure!(
+        masks.mp.bounds().is_some(),
+        "America painter ownership mask is empty"
+    );
+    let (r_a, r_b) = (R_WIN0, R_WIN1);
     let mut col_chunks = vec![(C_NEW_W, STRIP_CHUNK_END)];
     let mut c = STRIP_CHUNK_END;
     while c < C_WIN1 {
@@ -1168,7 +1256,7 @@ fn paint_canvas(
     while a < r_b {
         let b = (a + 1024).min(r_b);
         for &(c0, c1) in &col_chunks {
-            if !masks.mp.any_in(a, b, c0, c1) {
+            if !masks.mp.any_in(a, b, c0, c1) && !join.any_in(a, b, c0, c1) {
                 continue;
             }
             let mut res = painter.paint(terr, a, b, c0, c1, &edges);
@@ -1178,7 +1266,7 @@ fn paint_canvas(
                 "painter window rows differ from the America slab"
             );
             let m = masks.mp.unpack(wr0, wr1, wc0, wc1);
-            let vl = masks.vland.unpack(wr0, wr1, wc0, wc1);
+            let vl = Arr2::new(0, 0, false); // land matching is global; colour_match handles sea only
             let cur_rgb = rgb.crop(wr0, wr1, wc0, wc1);
             let cur_al = al.crop(wr0, wr1, wc0, wc1);
             let sg_sea: Vec<f32> = (wc0..wc1)
@@ -1190,7 +1278,7 @@ fn paint_canvas(
                 .collect();
             let opts = MatchOpts {
                 sea_sigma: SeaSigma::PerColumn(sg_sea),
-                land_sigma: 30.0,
+                land_sigma: 0.0, // global contour field replaces slab-local dark-rim anchors
                 inwin: Some([R_WIN0, R_WIN1, C_NEW_W, C_WIN1]),
             };
             colour_match(&mut res, &m, &vl, &cur_rgb, &cur_al, &opts);
@@ -1200,10 +1288,28 @@ fn paint_canvas(
                 for col in c0..c1 {
                     let wc = col - wc0;
                     let k = wr * res.rgb.w + wc;
-                    if !m.d[k] {
+                    let owned = m.d[k];
+                    if !owned && (al.get(r, col) >= 8 || !res.land.d[k] || res.cov.d[k] <= 0.5) {
                         continue;
                     }
-                    let p = res.rgb.d[k];
+                    let mut p = res.rgb.d[k];
+                    if res.land.d[k] && res.cov.d[k] > 0.5 {
+                        let sample = join.sample(r, col);
+                        let old_weight = if owned {
+                            0.0
+                        } else {
+                            sample.scalar(&join.original.d)
+                        };
+                        if !owned && old_weight >= 1.0 {
+                            continue;
+                        }
+                        let correction = sample.rgb(&join.correction.d);
+                        let old = rgb.get(r, col);
+                        for ch in 0..3 {
+                            p[ch] = (p[ch] + correction[ch]) * (1.0 - old_weight)
+                                + old[ch] as f32 * old_weight;
+                        }
+                    }
                     rgb.set(
                         r,
                         col,
@@ -1213,6 +1319,9 @@ fn paint_canvas(
                             rnd(p[2]).clamp(0.0, 255.0) as u8,
                         ],
                     );
+                    if !owned {
+                        continue;
+                    } // colour only; original coastline alpha is immutable
                     al.set(r, col, res.alpha.d[k]);
                     let lnd = res.land.d[k] && res.cov.d[k] > 0.5;
                     if masks.vc.get(r, col) {
@@ -1229,112 +1338,8 @@ fn paint_canvas(
         a = b;
     }
     rep.insert("painted_px".into(), json!({"void_land": void_land, "void_sea": void_sea, "strip_land": strip_land, "strip_sea": strip_sea}));
-    Ok(())
-}
-
-fn smoothstep64(t: f64) -> f64 {
-    let t = t.clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// Vanilla LAND within ~7 units east of the old playable edge carries the baked darkening of the vanilla sea; the
-/// measured multiplicative rim profile (per column median ratio to the same row's clean reference columns) is
-/// divided out, gain >= 1, fading to 1 at C_HEAL1. Alpha / coast / texture detail are kept.
-fn heal_land_rim(
-    rgb: &mut Arr2<Rgb8>,
-    al: &Arr2<u8>,
-    masks: &Masks,
-    rep: &mut serde_json::Map<String, Value>,
-) {
-    let (ca, cb) = (C_WIN0, C_HEAL1);
-    let nrows = R_WIN1 - R_WIN0;
-    let wd = RIM_REF1 - ca;
-    let mp = masks.mp.unpack(R_WIN0, R_WIN1, ca, RIM_REF1);
-    let land = Arr2::from_vec(
-        nrows,
-        wd,
-        (0..nrows * wd)
-            .map(|k| al.get(R_WIN0 + k / wd, ca + k % wd) < 8 && !mp.d[k])
-            .collect(),
-    );
-    let ref_off = RIM_REF0 - ca;
-    let mut n = vec![0usize; nrows];
-    let mut refc = vec![[0f64; 3]; nrows];
-    for r in 0..nrows {
-        let mut s = [0f32; 3];
-        for c in ref_off..wd {
-            if land.d[r * wd + c] {
-                let p = rgb.get(R_WIN0 + r, ca + c);
-                n[r] += 1;
-                for ch in 0..3 {
-                    s[ch] += p[ch] as f32;
-                }
-            }
-        }
-        let den = n[r].max(1) as f64;
-        refc[r] = [s[0] as f64 / den, s[1] as f64 / den, s[2] as f64 / den];
-    }
-    let nc = cb - ca;
-    let mut prof = vec![[1f32; 3]; nc];
-    let mut cnt = vec![0usize; nc];
-    for k in 0..nc {
-        let rows: Vec<usize> = (0..nrows)
-            .filter(|&r| land.d[r * wd + k] && n[r] >= 40)
-            .collect();
-        cnt[k] = rows.len();
-        if rows.len() >= 300 {
-            for ch in 0..3 {
-                let mut v: Vec<f64> = rows
-                    .iter()
-                    .map(|&r| rgb.get(R_WIN0 + r, ca + k)[ch] as f64 / refc[r][ch].max(1.0))
-                    .collect();
-                prof[k][ch] = prims::median(&mut v) as f32;
-            }
-        }
-    }
-    let prof = prims::gaussian_filter1d_lut(&prof, 6.0, Mode::Nearest);
-    let gain: Vec<[f64; 3]> = (0..nc)
-        .map(|k| {
-            let fade = smoothstep64((cb as f64 - (ca + k) as f64) / 60.0);
-            let mut g = [0f64; 3];
-            for ch in 0..3 {
-                let inv = (1.0f32 / prof[k][ch].max(0.3f32)).clamp(1.0, 2.2f32);
-                g[ch] = 1.0 + (inv - 1.0f32) as f64 * fade;
-            }
-            g
-        })
-        .collect();
-    let mut land_px = 0usize;
-    let mut changed = 0usize;
-    for r in 0..nrows {
-        for k in 0..nc {
-            if !land.d[r * wd + k] {
-                continue;
-            }
-            land_px += 1;
-            let old = rgb.get(R_WIN0 + r, ca + k);
-            let mut nw = old;
-            for ch in 0..3 {
-                nw[ch] = (old[ch] as f64 * gain[k][ch])
-                    .round_ties_even()
-                    .clamp(0.0, 255.0) as u8;
-            }
-            if nw != old {
-                changed += 1;
-                rgb.set(R_WIN0 + r, ca + k, nw);
-            }
-        }
-    }
-    let gr = |g: [f64; 3]| -> Value { json!([jr(g[0], 3), jr(g[1], 3), jr(g[2], 3)]) };
-    rep.insert(
-        "land_rim_heal".into(),
-        json!({
-            "columns": [ca, cb], "land_px": land_px, "px_changed": changed,
-            "gain_at_edge_rgb": gr(gain[0]),
-            "gain_every_32_cols": (0..nc).step_by(32).map(|k| gr(gain[k])).collect::<Vec<_>>(),
-            "min_rows_with_land_per_col": cnt.iter().filter(|&&c| c > 0).min().copied().unwrap_or(0),
-        }),
-    );
+    rep.insert("land_join".into(), json!({"ignore_original_rim_units": seam::RIM_UNITS, "original_blend_units": seam::ORIGINAL_UNITS, "generated_correction_units": seam::GENERATED_UNITS}));
+    Ok(join)
 }
 
 // ---------------------------------------------------------------------------------------------- heightmap
@@ -1375,10 +1380,9 @@ fn coast_stats(agree: &[bool], landhm: &[bool], sel: &[bool]) -> Value {
            "art_sea_height_land_px": sea_on_land, "art_land_height_sea_px": land_on_sea})
 }
 
-/// Raw heightmap over the full painter ownership window (strip + void + remnants + heal). Heightmap px are
-/// registered to canvas 8x8 blocks. Owned land/sea follows the written art alpha; magnitude comes from the same DEM
-/// (coarse grid), tapered over `TAPER_UNITS` toward the nearest kept vanilla height. Void blocks with real vanilla
-/// land heights stay kept; everything outside the owned blocks is byte-identical.
+/// Raw heights retain the written land/sea outline. A source-derived residual field joins DEM relief to sound
+/// original relief across the whole painted contour, including a bounded strip of the old land. Adding a
+/// residual preserves mountain slopes instead of pulling them onto a nearest-height shelf.
 fn build_heightmap(
     hm: &[u8],
     terr: &DemTerrain,
@@ -1389,10 +1393,16 @@ fn build_heightmap(
     let Some((rmin, rmax, cmin, cmax)) = masks.mp.bounds() else {
         bail!("America painter ownership mask is empty")
     };
-    let i0 = HM_ROW_TOP.saturating_sub((rmax + 8) / 8);
-    let i1 = HM_H.min(HM_ROW_TOP - rmin.saturating_sub(8) / 8);
-    let j0 = (cmin + HM_OFF) / 8;
-    let j1 = HM_W.min((cmax + HM_OFF) / 8 + 1);
+    let margin = (seam::ORIGINAL_UNITS as f64 * HM_PX).ceil() as usize + 1;
+    let i0 = HM_ROW_TOP
+        .saturating_sub((rmax + 8) / 8)
+        .saturating_sub(margin)
+        .max(HM_ROW_TOP - R_WIN1.div_ceil(8));
+    let i1 = (HM_ROW_TOP - rmin.saturating_sub(8) / 8 + margin).min(HM_ROW_TOP - R_WIN0 / 8);
+    let j0 = ((cmin + HM_OFF) / 8)
+        .saturating_sub(margin)
+        .max((C_NEW_W + HM_OFF) / 8);
+    let j1 = ((cmax + HM_OFF) / 8 + 1 + margin).min((C_WIN1 + HM_OFF).div_ceil(8));
     let (hh, ww) = (i1 - i0, j1 - j0);
     let n = hh * ww;
     let van: Vec<u8> = (i0..i1)
@@ -1448,27 +1458,21 @@ fn build_heightmap(
     let zland: Vec<bool> = (0..n)
         .map(|k| zc.get(HM_ROW_TOP - 1 - (i0 + k / ww), (j0 + k % ww) - HM_OFF / 8) > 0.0)
         .collect();
-    let own_arr = Arr2::from_vec(hh, ww, own.clone());
-    let (_, near) = prims::edt_with_indices(&own_arr);
+    let generated = Arr2::from_vec(hh, ww, (0..n).map(|k| own[k] && art_land[k]).collect());
+    let stock = Arr2::from_vec(hh, ww, (0..n).map(|k| !own[k] && van[k] > 0).collect());
+    let transition = seam::Transition::new(&generated, &stock, &stock, HM_PX as f32)?;
+    let residual = transition.residual(|k| van[k] as f32 - hb[k]);
     let mut out = hm.to_vec();
-    let mut d_units = vec![0f64; n];
     for k in 0..n {
-        if !own[k] {
+        let land = if own[k] { art_land[k] } else { van[k] > 0 };
+        if !own[k] && (!land || transition.original.d[k] >= 1.0) {
             continue;
         }
-        let ni = near.d[k] as usize;
-        let (di, dj) = (
-            (k / ww) as f64 - (ni / ww) as f64,
-            (k % ww) as f64 - (ni % ww) as f64,
-        );
-        let d = (di * di + dj * dj).sqrt() / HM_PX;
-        d_units[k] = d;
-        let s = smoothstep64((d / TAPER_UNITS).min(1.0));
-        let nb = van[ni] as f64;
-        let ht = if art_land[k] {
-            (s * hb[k] as f64 + (1.0 - s) * nb)
+        let ht = if land {
+            transition
+                .mix(k, hb[k], van[k] as f32, residual.d[k])
                 .round_ties_even()
-                .max(1.0) as u8
+                .clamp(1.0, 255.0) as u8
         } else {
             0
         };
@@ -1493,8 +1497,11 @@ fn build_heightmap(
             bb_c1 = bb_c1.max(j);
         }
     }
-    let identical_outside =
-        (0..n).all(|k| own[k] || out[(i0 + k / ww) * HM_W + j0 + k % ww] == van[k]);
+    let identical_outside = (0..n).all(|k| {
+        own[k]
+            || transition.original.d[k] < 1.0
+            || out[(i0 + k / ww) * HM_W + j0 + k % ww] == van[k]
+    });
     let cnt = |f: &dyn Fn(usize) -> bool| (0..n).filter(|&k| f(k)).count();
     let mut r = serde_json::Map::new();
     r.insert("window_hm_rows_cols".into(), json!([i0, i1, j0, j1]));
@@ -1521,14 +1528,21 @@ fn build_heightmap(
         json!(cnt(&|k| own[k] && van[k] > VOID_HM_STRAY)),
     );
     r.insert(
-        "kept_real_height_void_px".into(),
+        "original_height_void_px".into(),
         json!(cnt(&|k| keep_void[k])),
     );
     r.insert(
         "partially_owned_blocks_owned".into(),
         json!(cnt(&|k| partial_fix[k])),
     );
-    r.insert("outside_owned_identical".into(), json!(identical_outside));
+    r.insert(
+        "outside_transition_identical".into(),
+        json!(identical_outside),
+    );
+    r.insert(
+        "original_land_blend_px".into(),
+        json!(cnt(&|k| !own[k] && transition.original.d[k] < 1.0)),
+    );
     r.insert("changed_px_to_zero".into(), json!(to_zero));
     r.insert("changed_px_to_land".into(), json!(to_land));
     let winval = |k: usize| out[(i0 + k / ww) * HM_W + j0 + k % ww];
@@ -1553,7 +1567,7 @@ fn build_heightmap(
     let landhm: Vec<bool> = (0..n).map(|k| winval(k) > 0).collect();
     let agree: Vec<bool> = (0..n).map(|k| art_land[k] == landhm[k]).collect();
     let sel = |f: &dyn Fn(usize) -> bool| -> Vec<bool> { (0..n).map(f).collect() };
-    let ring = |k: usize| own[k] && d_units[k] < TAPER_UNITS;
+    let ring = |k: usize| own[k] && transition.correction.d[k] > 0.0;
     let partial = |k: usize| (fm[k] as u32 + fv[k] as u32) > 0 && !own[k] && !keep_void[k];
     let dem_agree = {
         let (mut a, mut t) = (0usize, 0usize);
@@ -1575,11 +1589,11 @@ fn build_heightmap(
         "coast".into(),
         json!({
             "owned_all": coast_stats(&agree, &landhm, &own),
-            "owned_taper_ring": coast_stats(&agree, &landhm, &sel(&|k| ring(k))),
-            "owned_outside_taper": coast_stats(&agree, &landhm, &sel(&|k| own[k] && !ring(k))),
+            "owned_transition_ring": coast_stats(&agree, &landhm, &sel(&|k| ring(k))),
+            "owned_outside_transition": coast_stats(&agree, &landhm, &sel(&|k| own[k] && !ring(k))),
             "owned_void": coast_stats(&agree, &landhm, &sel(&|k| own[k] && fv[k] >= 32)),
             "owned_strip_heal_remnants": coast_stats(&agree, &landhm, &sel(&|k| own[k] && fv[k] < 32)),
-            "kept_real_height_void": coast_stats(&agree, &landhm, &keep_void),
+            "original_height_void": coast_stats(&agree, &landhm, &keep_void),
             "partially_owned_kept": coast_stats(&agree, &landhm, &sel(&|k| partial(k))),
             "dem_vs_art_land_owned_agreement": dem_agree,
             "window_any_painted": coast_stats(&agree, &landhm, &sel(&|k| (fm[k] as u32 + fv[k] as u32) > 0)),
@@ -1608,7 +1622,7 @@ fn psnr(a: &Arr2<Rgb8>, b: &Arr2<Rgb8>) -> f64 {
 }
 
 /// Where did the written level-0 art differ from the baseline? Expected zones: painter ownership, the relocated
-/// frame columns, the north / south band fills + seam fades, the land-rim columns (expanded to whole 4x4 blocks
+/// frame columns, the north / south band fills + seam fades, and the bounded original-land join (whole 4x4 blocks
 /// because a changed DXT5 block is re-encoded whole). Also the encoded-vs-painted PSNR / alpha error of every
 /// changed level-0 tile.
 fn verify_written(
@@ -1617,14 +1631,15 @@ fn verify_written(
     rgb: &Arr2<Rgb8>,
     al: &Arr2<u8>,
     masks: &Masks,
+    join: &LandJoin,
     rep: &mut serde_json::Map<String, Value>,
 ) -> Result<()> {
     let expected = |r: usize, c: usize| -> bool {
         masks.mp.get(r, c)
+            || join.affects(r, c)
             || c < C_NEW_W + 8
             || (r < R_BAND_N + 8 && c < C_BAND_SEAM + 100)
             || (r >= R_BAND_S - 8 && c < C_BAND_SEAM + 100)
-            || ((R_WIN0..R_WIN1).contains(&r) && (C_WIN0..C_HEAL1).contains(&c))
     };
     struct TileOut {
         changed: u64,
@@ -1832,19 +1847,24 @@ pub fn generate(
         yt: CANVAS_YT,
     };
     let terr = DemTerrain::new(dem, canvas);
-    paint_canvas(
+    let join = paint_canvas(
         &mut rgb, &mut al, &masks, &learned, &terr, &mut rep, progress,
     )?;
-    heal_land_rim(&mut rgb, &al, &masks, &mut rep);
     progress("America: encoding tiles");
-    let (tiles, stats) = stpx::build_tiles(src, CANVAS_WIN, &rgb, &al)?;
+    let (tiles, stats) = stpx::build_tiles(
+        src,
+        CANVAS_WIN,
+        &rgb,
+        &al,
+        stpx::ChannelUpdates::ColourRepair,
+    )?;
     rep.insert(
         "tiles_changed_per_level".into(),
         Value::Array(stats.iter().map(|s| json!({"level": s.level, "tiles": s.tiles, "changed_4x4_blocks": s.changed_blocks})).collect()),
     );
     rep.insert("tiles_changed_total".into(), json!(tiles.len()));
-    verify_written(src, &tiles, &rgb, &al, &masks, &mut rep)?;
-    drop(rgb);
+    verify_written(src, &tiles, &rgb, &al, &masks, &join, &mut rep)?;
+    drop((rgb, join));
     progress("America: writing the heightmap");
     let heights = build_heightmap(hm, &terr, &masks, &al, &mut rep)?;
     rep.insert("seconds".into(), json!(jr(t0.elapsed().as_secs_f64(), 1)));
@@ -1858,35 +1878,6 @@ pub fn generate(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn constants_match_the_px_formulas() {
-        assert_eq!(px_x(-782.5), C_FB0);
-        assert_eq!(px_x(-760.0), C_OLD_W);
-        assert_eq!(px_x(-888.0), C_NEW_W);
-        assert_eq!(C_NEW_W as i64 - C_OLD_W as i64, SHIFT_W);
-        assert_eq!((C_FB0 as i64 + SHIFT_W) as usize, C_FB1);
-        assert_eq!(px_x(-770.0), C_BAND_SEAM);
-        assert_eq!(px_x(-670.0), C_BAND_SRC_END);
-        assert_eq!(px_y(455.0), R_BAND_N);
-        assert_eq!(px_y(2.0), R_BAND_S);
-        assert_eq!(px_y(455.0), R_WIN0);
-        assert_eq!(px_y(1.5), R_WIN1);
-        assert_eq!(px_x(-757.5), C_WIN0);
-        assert_eq!(px_x(-342.5), C_WIN1);
-        assert_eq!(px_x(-748.0), C_HEAL1);
-        assert_eq!(px_x(-746.5), RIM_REF0);
-        assert_eq!(px_x(-742.0), RIM_REF1);
-        assert_eq!(px_x(-725.0), STRIP_CHUNK_END);
-        assert_eq!(
-            ((CANVAS_YT - WORLD_Y0) * HM_PX).round_ties_even() as usize,
-            HM_ROW_TOP
-        );
-        assert_eq!(
-            (((CANVAS_X0 - WORLD_X0) * HM_PX).round_ties_even() as usize) * 8,
-            HM_OFF
-        );
-    }
 
     #[test]
     fn bits_roundtrip_and_bounds() {

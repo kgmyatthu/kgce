@@ -271,7 +271,7 @@ impl Painter {
         }
     }
 
-    fn land_colour(&self, h: f32, yw: f64) -> Rgbf {
+    pub(super) fn land_colour(&self, h: f32, yw: f64) -> Rgbf {
         let hi = h.clamp(0.0, 255.0);
         let h0 = hi.floor() as usize;
         let h1 = (h0 + 1).min(255);
@@ -563,6 +563,9 @@ pub fn colour_match(
         }
     };
     for sea_class in [true, false] {
+        if !sea_class && o.land_sigma <= 0.0 {
+            continue;
+        }
         let anchors: Arr2<bool> = if sea_class {
             let mut a = Arr2::new(h, w, false);
             for r in 0..h {

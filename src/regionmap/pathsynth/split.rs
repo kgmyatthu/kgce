@@ -360,7 +360,7 @@ pub fn synthesize_split(grid: &mut Grid, rd: &RegionData, source: usize, new: us
     report.degenerate_dropped = hyg.dropped;
     report.tjunctions = hyg.tjunctions;
     report.edge_vertices_synced = hyg.synced;
-    for f in hyg.failures {
+    if let Some(f) = hyg.failures.into_iter().next() {
         bail!("split path synthesis: {f}");
     }
 

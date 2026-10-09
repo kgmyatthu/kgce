@@ -422,22 +422,26 @@ fn encode_block_at(
     bx: usize,
     by: usize,
     refine: usize,
+    channels: u8,
 ) -> [u8; 16] {
-    let mut px = [[0u8; 3]; 16];
-    let mut al = [0u8; 16];
-    for k in 0..16 {
-        let o = (by * 4 + k / 4) * w + bx * 4 + k % 4;
-        px[k] = rgb[o];
-        al[k] = alpha[o];
-    }
-    let (c0, c1, bits) = encode_color_block(&px, refine);
     let mut out = [0u8; 16];
-    out[..8].copy_from_slice(&encode_alpha_block(&al));
-    out[8] = (c0 & 255) as u8;
-    out[9] = (c0 >> 8) as u8;
-    out[10] = (c1 & 255) as u8;
-    out[11] = (c1 >> 8) as u8;
-    out[12..16].copy_from_slice(&bits.to_le_bytes());
+    if channels & 1 != 0 {
+        let mut px = [[0u8; 3]; 16];
+        for k in 0..16 {
+            px[k] = rgb[(by * 4 + k / 4) * w + bx * 4 + k % 4];
+        }
+        let (c0, c1, bits) = encode_color_block(&px, refine);
+        out[8..10].copy_from_slice(&c0.to_le_bytes());
+        out[10..12].copy_from_slice(&c1.to_le_bytes());
+        out[12..16].copy_from_slice(&bits.to_le_bytes());
+    }
+    if channels & 2 != 0 {
+        let mut al = [0u8; 16];
+        for k in 0..16 {
+            al[k] = alpha[(by * 4 + k / 4) * w + bx * 4 + k % 4];
+        }
+        out[..8].copy_from_slice(&encode_alpha_block(&al));
+    }
     out
 }
 
@@ -453,7 +457,7 @@ pub fn dxt5_encode(rgb: &Arr2<Rgb8>, alpha: &Arr2<u8>) -> Vec<u8> {
     for by in 0..bh {
         for bx in 0..bw {
             let o = (by * bw + bx) * 16;
-            out[o..o + 16].copy_from_slice(&encode_block_at(&rgb.d, &alpha.d, rgb.w, bx, by, 2));
+            out[o..o + 16].copy_from_slice(&encode_block_at(&rgb.d, &alpha.d, rgb.w, bx, by, 2, 3));
         }
     }
     out
@@ -571,34 +575,47 @@ pub struct LevelStat {
     pub changed_blocks: usize,
 }
 
+/// A full repaint reconstructs both channels over its footprint. A colour repair must not
+/// resample the artist-authored coastline mips merely because nearby RGB pixels changed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ChannelUpdates {
+    Repaint,
+    ColourRepair,
+}
+
 /// Compact mip contribution of one tile for the next level: 2x box downsample of the tile and the 2x2-changed mask.
 struct Mip {
     r: Vec<Rgb8>,
     a: Vec<u8>,
-    m: Vec<bool>,
+    m: Vec<u8>, // bit 0: colour; bit 1: alpha
 }
 
-fn mip_of(r: &[Rgb8], a: &[u8], mask: &[bool]) -> Mip {
-    let mut m = vec![false; HALF * HALF];
+fn mip_of(r: &[Rgb8], a: &[u8], mask: &[u8]) -> Mip {
+    let mut m = vec![0u8; HALF * HALF];
     let mut mr = vec![[0u8; 3]; HALF * HALF];
     let mut ma = vec![0u8; HALF * HALF];
     for y in 0..HALF {
         for x in 0..HALF {
             let (o00, o01) = ((2 * y) * TILE_PX + 2 * x, (2 * y) * TILE_PX + 2 * x + 1);
             let (o10, o11) = (o00 + TILE_PX, o01 + TILE_PX);
-            if mask[o00] | mask[o01] | mask[o10] | mask[o11] {
+            let channels = mask[o00] | mask[o01] | mask[o10] | mask[o11];
+            if channels != 0 {
                 let i = y * HALF + x;
-                m[i] = true;
-                for c in 0..3 {
-                    mr[i][c] = ((r[o00][c] as u16
-                        + r[o10][c] as u16
-                        + r[o01][c] as u16
-                        + r[o11][c] as u16
-                        + 2)
+                m[i] = channels;
+                if channels & 1 != 0 {
+                    for c in 0..3 {
+                        mr[i][c] = ((r[o00][c] as u16
+                            + r[o10][c] as u16
+                            + r[o01][c] as u16
+                            + r[o11][c] as u16
+                            + 2)
+                            >> 2) as u8;
+                    }
+                }
+                if channels & 2 != 0 {
+                    ma[i] = ((a[o00] as u16 + a[o10] as u16 + a[o01] as u16 + a[o11] as u16 + 2)
                         >> 2) as u8;
                 }
-                ma[i] = ((a[o00] as u16 + a[o10] as u16 + a[o01] as u16 + a[o11] as u16 + 2) >> 2)
-                    as u8;
             }
         }
     }
@@ -613,10 +630,14 @@ struct TileJob {
     old_r: Vec<Rgb8>,
     old_a: Vec<u8>,
     raw_old: Vec<u8>,
-    mask: Vec<bool>,
+    mask: Vec<u8>,
 }
 
-fn finish_tile(job: TileJob, want_mip: bool) -> (Vec<u8>, usize, Option<Mip>) {
+fn finish_tile(
+    job: TileJob,
+    want_mip: bool,
+    channels: ChannelUpdates,
+) -> (Vec<u8>, usize, Option<Mip>) {
     let TileJob {
         new_r,
         new_a,
@@ -628,21 +649,27 @@ fn finish_tile(job: TileJob, want_mip: bool) -> (Vec<u8>, usize, Option<Mip>) {
     let mut changed = 0;
     for by in 0..BLOCKS_PER_ROW {
         for bx in 0..BLOCKS_PER_ROW {
-            let mut diff = false;
-            'blk: for py in 0..4 {
+            let mut diff = 0u8;
+            for py in 0..4 {
                 let o = (by * 4 + py) * TILE_PX + bx * 4;
                 for px in 0..4 {
-                    if new_r[o + px] != old_r[o + px] || new_a[o + px] != old_a[o + px] {
-                        diff = true;
-                        break 'blk;
-                    }
+                    diff |= (new_r[o + px] != old_r[o + px]) as u8;
+                    diff |= ((new_a[o + px] != old_a[o + px]) as u8) << 1;
                 }
             }
-            if diff {
+            if diff != 0 {
                 changed += 1;
+                if channels == ChannelUpdates::Repaint {
+                    diff = 3;
+                }
                 let i = (by * BLOCKS_PER_ROW + bx) * 16;
-                raw_old[i..i + 16]
-                    .copy_from_slice(&encode_block_at(&new_r, &new_a, TILE_PX, bx, by, 2));
+                let block = encode_block_at(&new_r, &new_a, TILE_PX, bx, by, 2, diff);
+                if diff & 1 != 0 {
+                    raw_old[i + 8..i + 16].copy_from_slice(&block[8..]);
+                }
+                if diff & 2 != 0 {
+                    raw_old[i..i + 8].copy_from_slice(&block[..8]);
+                }
             }
         }
     }
@@ -673,6 +700,7 @@ pub fn build_tiles(
     win: CanvasWindow,
     rgb: &Arr2<Rgb8>,
     alpha: &Arr2<u8>,
+    channels: ChannelUpdates,
 ) -> Result<(BTreeMap<usize, Vec<u8>>, Vec<LevelStat>)> {
     win.check()?;
     ensure!(
@@ -702,10 +730,18 @@ pub fn build_tiles(
                 new_r.extend_from_slice(&rgb.d[o..o + TILE_PX]);
                 new_a.extend_from_slice(&alpha.d[o..o + TILE_PX]);
             }
-            let mask: Vec<bool> = (0..TILE_RAW)
-                .map(|p| new_r[p] != old_rgb.d[p] || new_a[p] != old_al.d[p])
+            let mask: Vec<u8> = (0..TILE_RAW)
+                .map(|p| {
+                    let diff =
+                        (new_r[p] != old_rgb.d[p]) as u8 | (((new_a[p] != old_al.d[p]) as u8) << 1);
+                    if diff != 0 && channels == ChannelUpdates::Repaint {
+                        3
+                    } else {
+                        diff
+                    }
+                })
                 .collect();
-            if !mask.iter().any(|&m| m) {
+            if !mask.iter().any(|&m| m != 0) {
                 return Ok(None);
             }
             let job = TileJob {
@@ -716,7 +752,7 @@ pub fn build_tiles(
                 raw_old,
                 mask,
             };
-            let (raw, nb, mip) = finish_tile(job, true);
+            let (raw, nb, mip) = finish_tile(job, true, channels);
             Ok(Some((n, tx, ty, raw, nb, mip)))
         });
     let mut cur: BTreeMap<(usize, usize), Mip> = BTreeMap::new();
@@ -751,7 +787,7 @@ pub fn build_tiles(
                 let (old_rgb, old_al) = dxt5_decode_rgba(&raw_old);
                 let mut new_r = old_rgb.d.clone();
                 let mut new_a = old_al.d.clone();
-                let mut mask = vec![false; TILE_RAW];
+                let mut mask = vec![0u8; TILE_RAW];
                 for dy in 0..2 {
                     for dx in 0..2 {
                         let Some(m) = cur.get(&(tx * 2 + dx, ty * 2 + dy)) else {
@@ -760,11 +796,15 @@ pub fn build_tiles(
                         for y in 0..HALF {
                             for x in 0..HALF {
                                 let s = y * HALF + x;
-                                if m.m[s] {
+                                if m.m[s] != 0 {
                                     let o = (dy * HALF + y) * TILE_PX + dx * HALF + x;
-                                    new_r[o] = m.r[s];
-                                    new_a[o] = m.a[s];
-                                    mask[o] = true;
+                                    if m.m[s] & 1 != 0 {
+                                        new_r[o] = m.r[s];
+                                    }
+                                    if m.m[s] & 2 != 0 {
+                                        new_a[o] = m.a[s];
+                                    }
+                                    mask[o] = m.m[s];
                                 }
                             }
                         }
@@ -778,7 +818,7 @@ pub fn build_tiles(
                     raw_old,
                     mask,
                 };
-                let (raw, nb, mip) = finish_tile(job, want_mip);
+                let (raw, nb, mip) = finish_tile(job, want_mip, channels);
                 Ok((n, raw, nb, mip))
             });
         let mut next: BTreeMap<(usize, usize), Mip> = BTreeMap::new();
@@ -804,6 +844,89 @@ pub fn build_tiles(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn colour_repairs_preserve_shoreline_mips_but_coverage_edits_reach_them() {
+        struct Source {
+            levels: Vec<Vec<u8>>,
+        }
+        impl TileSource for Source {
+            fn raw_tile(&self, index: usize) -> Result<Vec<u8>> {
+                Ok(self.levels[tile_xy(index).0].clone())
+            }
+        }
+        // The artist's coarser coverage is deliberately not a box average of level zero.
+        let rgb = Arr2::new(TILE_PX, TILE_PX, [100, 140, 80]);
+        let source = Source {
+            levels: (0..LEVELS)
+                .map(|level| {
+                    dxt5_encode(&rgb, &Arr2::new(TILE_PX, TILE_PX, 20 * (level as u8 + 1)))
+                })
+                .collect(),
+        };
+        let (original_rgb, original_alpha) = dxt5_decode_rgba(&source.levels[0]);
+        let painted = Arr2::new(TILE_PX, TILE_PX, [180, 60, 45]);
+        let window = CanvasWindow {
+            tx0: 0,
+            ty0: 0,
+            ntx: 1,
+            nty: 1,
+        };
+        let (colour_tiles, _) = build_tiles(
+            &source,
+            window,
+            &painted,
+            &original_alpha,
+            ChannelUpdates::ColourRepair,
+        )
+        .unwrap();
+        let coverage = Arr2::new(TILE_PX, TILE_PX, 180);
+        let (coverage_tiles, _) = build_tiles(
+            &source,
+            window,
+            &original_rgb,
+            &coverage,
+            ChannelUpdates::ColourRepair,
+        )
+        .unwrap();
+        for level in 0..LEVELS {
+            let index = tile_index(level, 0, 0);
+            let colour = &colour_tiles[&index];
+            for (new, old) in colour
+                .chunks_exact(16)
+                .zip(source.levels[level].chunks_exact(16))
+            {
+                assert_eq!(
+                    &new[..8],
+                    &old[..8],
+                    "RGB repair rewrote coastline at mip {level}"
+                );
+            }
+            let (decoded, _) = dxt5_decode_rgba(colour);
+            for (value, expected) in decoded.d[0].iter().zip([180, 60, 45]) {
+                assert!(
+                    (*value as i16 - expected).abs() <= 4,
+                    "colour failed to reach mip {level}"
+                );
+            }
+            let coverage_tile = &coverage_tiles[&index];
+            for (new, old) in coverage_tile
+                .chunks_exact(16)
+                .zip(source.levels[level].chunks_exact(16))
+            {
+                assert_eq!(
+                    &new[8..],
+                    &old[8..],
+                    "coverage edit changed colour at mip {level}"
+                );
+            }
+            let (_, decoded) = dxt5_decode_rgba(coverage_tile);
+            assert_eq!(
+                decoded.d[0], 180,
+                "new coastline failed to reach mip {level}"
+            );
+        }
+    }
 
     #[test]
     fn tile_index_roundtrip() {

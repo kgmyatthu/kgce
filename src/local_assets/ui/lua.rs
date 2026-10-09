@@ -640,11 +640,10 @@ impl<'a> Dec<'a> {
                 bail!("{path}: repeat-until loop at instruction {pc} is not supported");
             }
         }
-        let n = p.code.len();
         Ok(Self {
             p,
             path,
-            regs: vec![None; 256.max(n.min(256))],
+            regs: vec![None; 256],
             while_heads,
         })
     }

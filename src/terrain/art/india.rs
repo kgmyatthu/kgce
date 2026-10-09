@@ -1736,8 +1736,13 @@ pub fn generate(
     );
 
     progress("India: encoding changed tiles");
-    let (tiles, stats): (BTreeMap<usize, Vec<u8>>, _) =
-        stpx::build_tiles(src, g.window(), &new_rgb, &new_al)?;
+    let (tiles, stats): (BTreeMap<usize, Vec<u8>>, _) = stpx::build_tiles(
+        src,
+        g.window(),
+        &new_rgb,
+        &new_al,
+        stpx::ChannelUpdates::Repaint,
+    )?;
     drop((new_rgb, new_al));
     rep.insert(
         "tiles_changed_per_level".into(),

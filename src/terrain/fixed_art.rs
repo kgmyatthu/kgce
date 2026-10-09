@@ -42,7 +42,7 @@ use std::{
 };
 
 /// Bump whenever a generator change alters the produced pixels; part of the cache binding.
-const RECIPE_VERSION: u32 = 1;
+const RECIPE_VERSION: u32 = 4;
 const MANIFEST_FORMAT: u32 = 1;
 const CACHE_DIR: &str = "fixed_art";
 

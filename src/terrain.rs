@@ -8,6 +8,7 @@ mod art;
 mod fixed_art;
 pub mod formats;
 mod raster;
+mod snow;
 pub mod theatre;
 
 pub use theatre::{
@@ -106,15 +107,28 @@ fn step_root_tgas(snapshot: &Snapshot, map_dir: &Path, progress: &Progress) -> R
 
 // ---------------------------------------------------------------------------------------------- heightmap
 
+/// Display heightmap with rows top-first: `raw` is the elevation after the fixed theatre repairs (what the terrain is),
+/// `shaped` the relief-curved result actually written (absent when the original relief curve is kept).
+struct Heights {
+    raw: Vec<u8>,
+    shaped: Option<Vec<u8>>,
+}
+
+impl Heights {
+    fn shaped(&self) -> &[u8] {
+        self.shaped.as_deref().unwrap_or(&self.raw)
+    }
+}
+
 /// Apply the fixed map's raw terrain repairs, then the project's relief curve and land-only smoothing.
-/// Relief preserves the repaired land/sea outline. Snow and fog derive from the resulting heightmap.
+/// Relief preserves the repaired land/sea outline. Fog derives from the shaped heightmap, snow from the repaired one.
 fn step_heightmap(
     snapshot: &Snapshot,
     display: &Path,
     relief: &TerrainRelief,
     fixed: &fixed_art::FixedArt,
     progress: &Progress,
-) -> Result<Vec<u8>> {
+) -> Result<Heights> {
     let mut b = snapshot.read(Game::Etw, "heightmaps/default.tga")?;
     let h = F::tga_header(&b)?;
     ensure!(
@@ -132,7 +146,7 @@ fn step_heightmap(
         wr(&display.join("heightmap/heightmap.tga"), &b)?;
         progress("Display: heightmap (fixed theatre terrain, 8192x4096, original relief curve)");
         let (_, _, top) = F::load_tga8(&b)?;
-        return Ok(top);
+        return Ok(Heights { raw: top, shaped: None });
     }
     relief.validate()?;
     let (w, hh, top) = F::load_tga8(&b)?;
@@ -154,7 +168,7 @@ fn step_heightmap(
         "Display: heightmap relief shaped (knee {}, uplands x{:.2}, blur {:.1} px): land mean {:.1}",
         relief.knee, relief.upland_scale, relief.smooth_sigma, mean
     ));
-    Ok(shaped)
+    Ok(Heights { raw: top, shaped: Some(shaped) })
 }
 
 /// Relief curve + land-only Gaussian blur; sea pixels are excluded from the blur so coastlines never move.
@@ -324,12 +338,11 @@ fn step_detail(snapshot: &Snapshot, display: &Path, progress: &Progress) -> Resu
         &display.join("detail/campaign_rocks.dds"),
         &F::dds_with_linear_size(&read("campaign/terrain/rocks1_diffuse.dds")?)?,
     )?;
-    for n in ["campaign_snow_mask_summer", "campaign_snow_mask_winter"] {
-        wr(
-            &display.join(format!("snowmask/{n}.dds")),
-            &read(&format!("campaign/terrain/{n}.dds"))?,
-        )?;
-    }
+    // The summer mask is blank over America (nothing to continue); the winter mask is written with the snow.
+    wr(
+        &display.join("snowmask/campaign_snow_mask_summer.dds"),
+        &read("campaign/terrain/campaign_snow_mask_summer.dds")?,
+    )?;
     for n in [
         "river_diffuse",
         "river_distortion",
@@ -341,26 +354,40 @@ fn step_detail(snapshot: &Snapshot, display: &Path, progress: &Progress) -> Resu
             &read(&format!("rigidmodels/campaignrivers/textures/{n}.dds"))?,
         )?;
     }
-    progress("Display: detail, rocks, snow-mask pair and river textures");
+    progress("Display: detail, rocks, summer snow mask and river textures");
     Ok(())
 }
 
-/// `snow/winter.dds` and `fogmask/fogmask.dds`: 8-bit luminance DDS, 4096x2048 over the whole world.
+/// `snowmask/campaign_snow_mask_winter.dds`, `snow/winter.dds` and `fogmask/fogmask.dds`.
+///
+/// The ETW winter snow mask is painted for the original America rectangle and has a rounded edge inside its old west
+/// border; [`snow::extend_winter_mask`] continues its latitude zone over the enlarged theatre (with a terrain-driven
+/// snow line) and the result feeds both the DXT5 mask pair member and the 4096x2048 luminance `snow/winter.dds`
+/// (bicubic upsampling, masked by land). The rest of the mask and every mip block outside the changed area is kept
+/// bit-exact. The summer mask carries no America snow and is copied unchanged by [`step_detail`].
 fn step_snow_fog(
     snapshot: &Snapshot,
     display: &Path,
-    heightmap_top: &[u8],
+    heights: &Heights,
     progress: &Progress,
 ) -> Result<()> {
     const HW: usize = 8192;
     const HH: usize = 4096;
+    let heightmap_top = heights.shaped();
     ensure!(heightmap_top.len() == HW * HH, "Unexpected heightmap size");
 
-    // Snow: ETW winter coverage (red channel of the 2048x1024 DXT5 mask) bicubically upsampled, masked by land.
-    let (sw, sh, red) = raster::dxt5_red(
-        &snapshot.read(Game::Etw, "campaign/terrain/campaign_snow_mask_winter.dds")?,
+    let winter = snapshot.read(Game::Etw, "campaign/terrain/campaign_snow_mask_winter.dds")?;
+    let (sw, sh, source) = raster::dxt5_red(&winter)?;
+    ensure!(
+        (sw, sh) == (snow::MASK_W, snow::MASK_H),
+        "Unexpected ETW winter snow mask size {sw}x{sh}"
+    );
+    let extended = snow::extend_winter_mask(&source, &heights.raw)?;
+    wr(
+        &display.join("snowmask/campaign_snow_mask_winter.dds"),
+        &snow::patch_winter_dds(&winter, &source, &extended)?,
     )?;
-    let big = raster::resize_l8(&red, sw, sh, 4096, 2048, raster::Filter::Bicubic)?;
+    let big = raster::resize_l8(&extended, sw, sh, 4096, 2048, raster::Filter::Bicubic)?;
     let mut land = vec![false; 4096 * 2048];
     for y in 0..2048 {
         for x in 0..4096 {
@@ -373,13 +400,13 @@ fn step_snow_fog(
         }
     }
     let land = raster::dilate_cross(&land, 4096, 2048);
-    let snow: Vec<u8> = big
+    let snow_pixels: Vec<u8> = big
         .iter()
         .zip(&land)
         .map(|(&v, &l)| if l { v } else { 0 })
         .collect();
     let mut snow_dds = F::dds_header_l8(4096, 2048);
-    snow_dds.extend_from_slice(&snow);
+    snow_dds.extend_from_slice(&snow_pixels);
     wr(&display.join("snow/winter.dds"), &snow_dds)?;
 
     // Fog: NTW fog correlates with blurred terrain height: fog = min(119, 1.6 * gauss(height)) at 8x8 block means.
@@ -404,7 +431,7 @@ fn step_snow_fog(
     let mut fog_dds = F::dds_header_l8(4096, 2048);
     fog_dds.extend(fog.iter().map(|v| v.clamp(0.0, 255.0) as u8));
     wr(&display.join("fogmask/fogmask.dds"), &fog_dds)?;
-    progress("Display: snow/winter.dds and fogmask/fogmask.dds interpolated from ETW masks");
+    progress("Display: winter snow mask extended over the enlarged America theatre; snow/winter.dds and fogmask/fogmask.dds written");
     Ok(())
 }
 
