@@ -1,0 +1,174 @@
+{
+ "etw": {
+  "afghanistan": {
+   "capital": "afghanistan",
+   "playable": false,
+   "rebel_faction": "ottoman_rebels",
+   "template": "crimean_khanate"
+  },
+  "barbary_states": {
+   "capital": "algiers",
+   "playable": false,
+   "rebel_faction": "ottoman_rebels",
+   "template": "crimean_khanate"
+  },
+  "chechenya_dagestan": {
+   "capital": "chechenya-dagestan",
+   "playable": false,
+   "rebel_faction": "ottoman_rebels",
+   "template": "crimean_khanate"
+  },
+  "cherokee": {
+   "capital": "cherokee_territory",
+   "playable": false,
+   "rebel_faction": "british_rebels",
+   "template": "crimean_khanate"
+  },
+  "huron": {
+   "capital": "huron_territory",
+   "playable": false,
+   "rebel_faction": "british_rebels",
+   "template": "crimean_khanate"
+  },
+  "inuit": {
+   "capital": "labrador",
+   "playable": false,
+   "rebel_faction": "british_rebels",
+   "template": "crimean_khanate"
+  },
+  "iroquoi": {
+   "capital": "iroquois_territory",
+   "playable": false,
+   "rebel_faction": "british_rebels",
+   "template": "crimean_khanate"
+  },
+  "maratha": {
+   "capital": "ahmadnagar",
+   "playable": true,
+   "rebel_faction": "ottoman_rebels",
+   "template": "ottomans"
+  },
+  "morocco": {
+   "capital": "morocco",
+   "playable": false,
+   "rebel_faction": "ottoman_rebels",
+   "template": "crimean_khanate"
+  },
+  "mughal": {
+   "capital": "hindustan",
+   "playable": false,
+   "rebel_faction": "ottoman_rebels",
+   "template": "ottomans"
+  },
+  "mysore": {
+   "capital": "mysore",
+   "playable": false,
+   "rebel_faction": "ottoman_rebels",
+   "template": "crimean_khanate"
+  },
+  "new_spain": {
+   "capital": "new_spain",
+   "playable": false,
+   "rebel_faction": "spanish_rebels",
+   "template": "portugal"
+  },
+  "plains": {
+   "capital": "great_plains",
+   "playable": false,
+   "rebel_faction": "british_rebels",
+   "template": "crimean_khanate"
+  },
+  "punjab": {
+   "capital": "punjab",
+   "playable": false,
+   "rebel_faction": "ottoman_rebels",
+   "template": "crimean_khanate"
+  },
+  "safavids": {
+   "capital": "persia",
+   "playable": false,
+   "rebel_faction": "ottoman_rebels",
+   "template": "ottomans"
+  },
+  "united_states": {
+   "capital": "new_england",
+   "playable": true,
+   "rebel_faction": "british_rebels",
+   "template": "netherlands"
+  }
+ },
+ "ntw": {
+  "austria": {
+   "capital": "austria",
+   "playable": true
+  },
+  "bavaria": {
+   "capital": "bavaria",
+   "playable": false
+  },
+  "britain": {
+   "capital": "england",
+   "playable": true
+  },
+  "denmark": {
+   "capital": "denmark",
+   "playable": false
+  },
+  "france": {
+   "capital": "france",
+   "playable": true
+  },
+  "ita_papal_states": {
+   "capital": "the_papal_states",
+   "playable": false
+  },
+  "italy_kingdom": {
+   "capital": "milan",
+   "playable": false
+  },
+  "naples": {
+   "capital": "naples",
+   "playable": false
+  },
+  "netherlands": {
+   "capital": "netherlands",
+   "playable": true
+  },
+  "ottomans": {
+   "capital": "rumelia",
+   "playable": true
+  },
+  "portugal": {
+   "capital": "portugal",
+   "playable": false
+  },
+  "prussia": {
+   "capital": "west_pommerania",
+   "playable": true
+  },
+  "russia": {
+   "capital": "muscovy",
+   "playable": true
+  },
+  "sardinia": {
+   "capital": "sardinia",
+   "playable": false
+  },
+  "saxony": {
+   "capital": "saxony",
+   "playable": false
+  },
+  "spain": {
+   "capital": "spain",
+   "playable": true
+  },
+  "sweden": {
+   "capital": "sweden",
+   "playable": true
+  },
+  "wurttemberg": {
+   "capital": "wurttemberg",
+   "playable": false
+  }
+ }
+}

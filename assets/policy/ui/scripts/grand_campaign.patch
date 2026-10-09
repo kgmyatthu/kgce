@@ -1,0 +1,11 @@
+# Preserve the working world-campaign root behavior without development logging.
+# A failed OpenMapDataFile call must not prevent the panel's Initialise callback.
+@@ replace in OnEnter
+= FrontEnd.OpenMapDataFile(selected_campaign)
+@@ body
+pcall(FrontEnd.OpenMapDataFile, selected_campaign)
+@@ replace in StartCampaign
+= FrontEnd.StartCampaign(selected_campaign, main_panel:LuaCall("FactionAndVCType"))
+@@ body
+local fac, vc = main_panel:LuaCall("FactionAndVCType")
+FrontEnd.StartCampaign(selected_campaign, fac, vc)

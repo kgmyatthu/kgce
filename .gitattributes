@@ -1,0 +1,5 @@
+# Consistent source text regardless of the machine's core.autocrlf setting.
+* text=auto eol=lf
+
+# Game-derived build assets must remain byte-exact across checkouts.
+/assets/** -text

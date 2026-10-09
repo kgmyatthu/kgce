@@ -1,0 +1,15 @@
+# Local projects, immutable game snapshots, imported targets and exported campaigns
+/workspace/
+
+# Compiled application and Rust build output
+/target/
+/KgcPortEditor.exe
+*.pdb
+
+# Python environments and bytecode
+/.venv/
+__pycache__/
+*.py[cod]
+
+# Downloaded public elevation tiles (developer preparation only)
+/tools/terrain_paint/dem/cache/

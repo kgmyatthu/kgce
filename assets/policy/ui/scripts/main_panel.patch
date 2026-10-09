@@ -1,0 +1,55 @@
+# Faction selection panel (new layout script wld_grand_campaign_scripts/main_panel.luac).
+# The stock panel has one preview per theatre key and assumes every theatre of the campaign has one. The world
+# campaign has the three land theatres (europe, america, india) with previews and sea-trade theatres without:
+# those are skipped, previews of theatres the campaign does not have are hidden, and the region ownership
+# overlay is generated only for the theatres that have a preview.
+@@ after
+= local spanish_campaign = false
+@@ body
+local shown_theatres = {}
+@@ function InitialiseMaps
+@@ body
+function InitialiseMaps()
+  shown_theatres = {}
+  for k, v in pairs(theatres) do
+    out.tom("theatre", k)
+    local m = maps[k]
+    if m ~= nil then
+      v.Component = this:Find(m.Component, false)
+      if v.Component ~= nil then
+        v.Component = UIComponent(v.Component)
+        local image = UIImage(v.Map)
+        image:SetComponentTexture(v.Component:Address(), 0)
+        shown_theatres[#shown_theatres + 1] = k
+      end
+    end
+  end
+  table.sort(shown_theatres)
+  for k, m in pairs(maps) do
+    local c = this:Find(m.Component, false)
+    if c ~= nil then
+      local used = false
+      for i, name in ipairs(shown_theatres) do
+        if name == k then
+          used = true
+        end
+      end
+      UIComponent(c):SetVisible(used)
+    end
+  end
+end
+@@ through in NotifyFactionSelected
+= local theatre_names_list = {}
+= ..
+= image:SetComponentTexture(v.Component:Find("map_overlay"), 0)
+= end
+@@ body
+if #shown_theatres > 0 then
+  local theatre_maps = FrontEnd.GenerateRegionOwnershipMaps(shown_theatres, campaign_details.Key, faction)
+  for i, k in ipairs(shown_theatres) do
+    if theatre_maps[k] ~= nil then
+      local image = UIImage(theatre_maps[k])
+      image:SetComponentTexture(theatres[k].Component:Find("map_overlay"), 0)
+    end
+  end
+end

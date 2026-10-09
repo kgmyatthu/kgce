@@ -1,0 +1,11 @@
+# Campaign HUD script (ui/campaign ui/layout_scripts/campaign_hud.luac).
+# The stock layout keeps the globe theatre selector and the theatre banner hidden because a stock Napoleon
+# campaign has one theatre. Multi-theatre campaigns show both; the stock navigation handlers are unchanged.
+@@ after in InitState
+= theatre_buttons:SetGlobal("g_notify_func", NotifyTheatreSelected)
+= SetWorldMapVisibility(false)
+@@ body
+if #CampaignUI.TheatreList(false) > 1 then
+  UIComponent(this:Find("globe")):SetVisible(true)
+  UIComponent(this:Find("radar_banner")):SetVisible(true)
+end

@@ -1,0 +1,36 @@
+[package]
+name = "kgc_port_editor"
+version = "0.6.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "kgc_port_editor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "KgcPortEditor"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+hex = "0.4"
+flate2 = "1"
+regex = "1"
+walkdir = "2"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+image = { version = "0.25", default-features = false, features = ["png", "tga", "dds"] }
+eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "glow", "x11", "wayland"] }
+geo = "0.30"
+i_overlay = "2"
+
+[profile.release]
+opt-level = 3
+# Avoid whole-program LTO and serial code generation on every editor rebuild.
+# Keep runtime optimization while reusing incremental results between source edits.
+lto = false
+codegen-units = 16
+incremental = true

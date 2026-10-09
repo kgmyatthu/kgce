@@ -1,0 +1,18 @@
+# Theatre transit modal "Travel Destinations" (ui/campaign ui/travel_destinations.luac).
+# The stock script closes itself with panel_manager.ClosePopup, which the PanelManager module does not
+# export (ClosePopup is a global of the campaign root script), so neither the tick nor the X could dismiss the
+# modal after the native FinaliseMoveTransition call. The panel is closed the way every other popup is.
+@@ replace
+= local panel_manager = utils.Require("PanelManager")
+@@ body
+local function close_popup()
+  UIComponent(Component.Root()):LuaCall("ClosePopup", Address)
+end
+@@ replace in OnAccept
+= panel_manager.ClosePopup(Address)
+@@ body
+close_popup()
+@@ replace in OnCancel
+= panel_manager.ClosePopup(Address)
+@@ body
+close_popup()

@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "provenance": "Authored conversion recipe for the world campaign front end. Every layout and script is derived at run time from the user's own Napoleon: Total War installation (snapshot ntw/ui); nothing from the game is stored here, only the structural edits (this file) and the text patches (scripts/*.patch).",
+  "world_layout": "wld_grand_campaign",
+  "source_world_layout": "grand_campaign",
+  "button": {
+    "title": "world_campaign",
+    "text": "Grand Campaign",
+    "loc_key": "button_txt_NewState_Text_wld_grand_campaign",
+    "heading_loc_key": "heading_txt_NewState_Text_wld_grand_campaign"
+  },
+  "main_menu": {
+    "layouts": ["main", "spain_main"],
+    "id_start": 700000001,
+    "pitch": 40,
+    "allowed_stock_pitch": [40, 80]
+  },
+  "world": {
+    "id_start": 700100001,
+    "templates": {
+      "root": "../wld_grand_campaign_scripts/grand_campaign.lua",
+      "main_panel": "../wld_grand_campaign_scripts/main_panel.lua",
+      "faction_selection": "../wld_grand_campaign_scripts/faction_selection.lua",
+      "advanced_options": "../grand_campaign_scripts/advanced_options.lua"
+    },
+    "maps": {
+      "container_y": 131,
+      "prototype": "map_nap_europe",
+      "previews": [
+        { "component": "EU_map", "x": 216, "y": 1, "w": 390, "h": 230 },
+        { "component": "US_map", "x": 2, "y": 60, "w": 201, "h": 230 },
+        { "component": "IND_map", "x": 619, "y": 60, "w": 201, "h": 230 }
+      ]
+    },
+    "factions": {
+      "area_x": 0,
+      "area_y": -4,
+      "area_w": 1280,
+      "area_h": 134,
+      "columns": 9,
+      "rows": 2,
+      "pitch_x": 128,
+      "pitch_y": 66,
+      "scale": 0.8
+    }
+  },
+  "scripts": [
+    { "source": "ui/frontend ui/main.main.luac", "output": "ui/frontend ui/main.main.luac", "patch": "main.main.patch" },
+    { "source": "ui/frontend ui/grand_campaign_scripts/grand_campaign.luac", "output": "ui/frontend ui/wld_grand_campaign_scripts/grand_campaign.luac", "patch": "grand_campaign.patch" },
+    { "source": "ui/frontend ui/grand_campaign_scripts/main_panel.luac", "output": "ui/frontend ui/wld_grand_campaign_scripts/main_panel.luac", "patch": "main_panel.patch" },
+    { "source": "ui/frontend ui/grand_campaign_scripts/faction_selection.luac", "output": "ui/frontend ui/wld_grand_campaign_scripts/faction_selection.luac", "patch": "faction_selection.patch" },
+    { "source": "ui/campaign ui/travel_destinations.luac", "output": "ui/campaign ui/travel_destinations.luac", "patch": "travel_destinations.patch" },
+    { "source": "ui/campaign ui/layout_scripts/campaign_hud.luac", "output": "ui/campaign ui/layout_scripts/campaign_hud.luac", "patch": "campaign_hud.patch" }
+  ]
+}

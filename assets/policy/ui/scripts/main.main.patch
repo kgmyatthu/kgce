@@ -1,0 +1,17 @@
+# Front-end main menu script (ui/frontend ui/main.main.luac).
+# Adds the click handler of the new "Grand Campaign" button (layout title world_campaign) that opens the
+# world campaign selection layout. Only the non-demo branch gets it; the lookup is guarded so a layout
+# without the button (for example a different main layout) can never abort InitState.
+@@ after
+= UIComponent(m_buttons.singleplayer:Find("grand_campaign")):SetGlobal("g_click_callback", function()
+= Root:LuaCall("TransitionTo", "grand_campaign", nil, grand_campaign_key)
+= end)
+@@ body
+local found, world_campaign_button = pcall(function()
+  return m_buttons.singleplayer:Find("world_campaign")
+end)
+if found and world_campaign_button ~= nil then
+  UIComponent(world_campaign_button):SetGlobal("g_click_callback", function()
+    Root:LuaCall("TransitionTo", "wld_grand_campaign", nil, "wld_napoleon")
+  end)
+end

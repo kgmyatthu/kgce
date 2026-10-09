@@ -1,0 +1,14 @@
+{
+ "campaign": "wld_napoleon",
+ "variables": {
+  "character_recruitment_max_distance": 550.0,
+  "faction_gdp_other": 1700.0,
+  "faction_gdp_other_minor": 2000.0
+ },
+ "loc": [
+  ["button_txt_NewState_Text_wld_grand_campaign", "Grand Campaign", "ui"],
+  ["campaigns_description_wld_napoleon", "1805. The Third Coalition is forming and the whole world is the stage: play the great powers of Europe, the colonial empires of the Americas and the princely states of India on one map, with fleets linking all three theatres.", "localisation"],
+  ["campaigns_onscreen_name_wld_napoleon", "Grand Campaign", "localisation"],
+  ["heading_txt_NewState_Text_wld_grand_campaign", "Grand Campaign", "ui"]
+ ]
+}

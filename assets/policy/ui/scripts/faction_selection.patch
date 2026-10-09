@@ -1,0 +1,51 @@
+# Faction flag grid (new layout script wld_grand_campaign_scripts/faction_selection.luac).
+# The stock script fills four fixed placeholder cells. The world campaign layout carries 18 placeholder
+# cells (9 per row, 2 rows) at a fixed pitch; the cells in use are re-centred per row at run time and the
+# unused ones are hidden (empty placeholders would otherwise swallow mouse clicks and overlap the moved flags).
+# The geometry constants match policy/ui/ui.json (world_layout.factions).
+@@ after
+= local panel, selected_faction
+@@ body
+local COLUMNS = 9
+local MAX_FACTIONS = 18
+local PITCH_X = 128
+local PITCH_Y = 66
+local CELL_W = 120
+local CELL_H = 60
+local AREA_W = 1280
+local AREA_H = 134
+@@ replace in Initialise
+= for i, v in ipairs(factions) do
+@@ body
+local total = #factions
+if total > MAX_FACTIONS then
+  total = MAX_FACTIONS
+end
+local rows = math.ceil(total / COLUMNS)
+local first = UIComponent(this:Find("placeholder_faction_1"))
+local origin_x, origin_y = first:Position()
+local base_y = (AREA_H - (rows * PITCH_Y - (PITCH_Y - CELL_H))) / 2 - 4
+for i = 1, total do
+  local v = factions[i]
+@@ after in Initialise
+= if container ~= nil then
+@@ body
+  local row = math.floor((i - 1) / COLUMNS)
+  local col = (i - 1) - row * COLUMNS
+  local in_row = COLUMNS
+  if row == rows - 1 then
+    in_row = total - row * COLUMNS
+  end
+  local row_w = in_row * PITCH_X - (PITCH_X - CELL_W)
+  local x = (AREA_W - row_w) / 2 + col * PITCH_X
+  local y = base_y + row * PITCH_Y
+  UIComponent(container):MoveTo(origin_x + x, origin_y + y)
+@@ before in Initialise
+= FactionSelected(factions[1].Key)
+@@ body
+for i = total + 1, MAX_FACTIONS do
+  local unused = this:Find("placeholder_faction_" .. tostring(i), false)
+  if unused ~= nil then
+    UIComponent(unused):SetVisible(false)
+  end
+end

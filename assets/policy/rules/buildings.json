@@ -1,0 +1,440 @@
+{
+ "chain_slot": {
+  "fFort": "fort",
+  "pNavy": "port",
+  "pTrade": "port",
+  "rFarm": "wheat",
+  "rGold": "gold",
+  "rHorse": "horses",
+  "rIron": "iron",
+  "rTimber": "timber",
+  "rWine": "wine",
+  "sAdmin": "settlement",
+  "sArmy": "settlement",
+  "sCannon": "settlement",
+  "sCulture": "settlement",
+  "sFortifications": "settlement_fortification",
+  "sRoads": "settlement_road"
+ },
+ "pioneer": [
+  "NA_pioneer_01"
+ ],
+ "plantation": {
+  "NA_pioneer_01": 1,
+  "coffee_warehouse": 3,
+  "cotton_warehouse": 3,
+  "large_coffee_plantation": 2,
+  "large_cotton_plantation": 2,
+  "large_spices_plantation": 2,
+  "large_sugar_plantation": 2,
+  "large_tea_plantation": 2,
+  "large_tobacco_plantation": 2,
+  "small_coffee_plantation": 1,
+  "small_cotton_plantation": 1,
+  "small_spices_plantation": 1,
+  "small_sugar_plantation": 1,
+  "small_tea_plantation": 1,
+  "small_tobacco_plantation": 1,
+  "spices_warehouse": 3,
+  "steam-powered_sugar_mill": 3,
+  "sugar_warehouse": 3,
+  "tea_warehouse": 3,
+  "tobacco_warehouse": 3,
+  "tribal_playable_small_coffee_plantation": 1,
+  "tribal_playable_small_cotton_plantation": 1,
+  "tribal_playable_small_sugar_plantation": 1,
+  "tribal_playable_small_tobacco_plantation": 1
+ },
+ "prestige_culture": {
+  "prest_austria_albertina": "sCulture5_austria_theatrewien",
+  "prest_britain_british_museum": "sCulture5_britain_nationalgallery",
+  "prest_prussia_berlin_academy": "sCulture5_prussia_humboldt",
+  "prest_russia_kunstkamara": "sCulture5_russia_kremlinarmoury"
+ },
+ "prestige_museum": {
+  "chain": "sCulture",
+  "level": 4,
+  "prefixes": [
+   "prest_ottomans",
+   "prest_poland",
+   "prest_spain",
+   "prest_sweden",
+   "prest_unitedprovinces",
+   "prest_usa",
+   "prest_maratha"
+  ],
+  "words": [
+   "museum",
+   "academy",
+   "mosque",
+   "park",
+   "teylers",
+   "smithsonian",
+   "konglig"
+  ]
+ },
+ "resource_slot": {
+  "caribbean": "wine",
+  "corn": "wheat",
+  "cuba": "wine",
+  "egypt": "wheat",
+  "fort": "fort",
+  "fur": "timber",
+  "gems": "gold",
+  "gold": "gold",
+  "india_highlands": "wine",
+  "iron": "iron",
+  "port": "port",
+  "rice": "wheat",
+  "sheep": "horses",
+  "silver": "gold",
+  "southern_usa": "wheat",
+  "timber": "timber",
+  "tropical_humid": "wine",
+  "wheat": "wheat",
+  "wine": "wine"
+ },
+ "settlement_sub": {
+  "settlement_fortification": "settlement_fortification",
+  "settlement_road": "settlement_road"
+ },
+ "simple": {
+  "fFort": {
+   "star_fort": 3,
+   "western_artillery_fort": 2,
+   "wooden_artillery_fort": 1
+  },
+  "pNavy": {
+   "dockyard": 2,
+   "drydock": 2,
+   "naval_hospital": 2,
+   "shipyard": 1,
+   "steam_drydock": 3
+  },
+  "pTrade": {
+   "commercial_basin": 2,
+   "commercial_port": 2,
+   "fishing_fleet": 1,
+   "local_fishery": 1,
+   "major_fishery": 2,
+   "trading_company": 3,
+   "trading_port": 1,
+   "tribal_playable_fishing_fleet": 1,
+   "tribal_playable_local_fishery": 1
+  },
+  "rFarm": {
+   "corn_clearances": 2,
+   "corn_great_estates": 3,
+   "corn_great_royal_palace": 3,
+   "corn_peasant_farms": 1,
+   "corn_tenanted_farms": 1,
+   "rice_farming_commune": 3,
+   "rice_farms": 2,
+   "rice_paddies": 1,
+   "tribal_corn_communal_farms": 2,
+   "tribal_corn_subsistence_farms": 1,
+   "tribal_playable_corn_communal_farms": 2,
+   "tribal_playable_corn_subsistence_farms": 1,
+   "tribal_playable_wheat_communal_farms": 2,
+   "tribal_playable_wheat_subsistence_farms": 1,
+   "tribal_wheat_communal_farms": 2,
+   "tribal_wheat_subsistence_farms": 1,
+   "wheat_clearances": 2,
+   "wheat_great_estates": 3,
+   "wheat_great_royal_palace": 3,
+   "wheat_peasant_farms": 1,
+   "wheat_tenanted_farms": 1
+  },
+  "rGold": {
+   "deep_gem_shaft": 2,
+   "gold_mine": 1,
+   "industrial_gold_mining_complex": 3,
+   "industrial_silver_mining_complex": 3,
+   "open_gem_pit": 1,
+   "silver_mine": 1,
+   "steam-pumped_gold_mine": 2,
+   "steam-pumped_silver_mine": 2,
+   "tribal_playable_gem_pit": 1,
+   "tribal_playable_gold_mine": 1,
+   "tribal_playable_silver_mine": 1
+  },
+  "rHorse": {
+   "sheep_clearances": 2,
+   "sheep_great_estates": 3,
+   "sheep_great_royal_palace": 3,
+   "sheep_peasant_farms": 1,
+   "sheep_tenanted_farms": 1,
+   "tribal_playable_sheep_communal_farms": 2,
+   "tribal_playable_sheep_subsistence_farms": 1
+  },
+  "rIron": {
+   "industrial_iron_mining_complex": 3,
+   "iron_mine": 1,
+   "steam-pumped_iron_mine": 2,
+   "tribal_playable_iron_mine": 1
+  },
+  "rTimber": {
+   "fur_exchange": 3,
+   "fur_market": 2,
+   "fur_merchant": 1,
+   "timber_logging_camp": 1,
+   "timber_lumber_mill": 2,
+   "tribal_playable_fur_market": 2,
+   "tribal_playable_fur_merchant": 1
+  },
+  "rWine": {
+   "vineyards": 1,
+   "wine_estates": 3,
+   "wineries": 2
+  },
+  "sAdmin": {
+   "governors_mansion": 3,
+   "governors_palace": 4,
+   "governors_residence": 2,
+   "imperial_palace": 5,
+   "magistrate": 2,
+   "minor_governors_mansion": 3,
+   "minor_governors_palace": 4,
+   "minor_governors_residence": 2,
+   "minor_magistrate": 1,
+   "minor_royal_palace": 5,
+   "royal_palace": 5,
+   "tribal_chiefs_lodge": 2,
+   "tribal_confederation_of_tribes": 4,
+   "tribal_council_of_elders": 1,
+   "tribal_high_chiefs_lodge": 3,
+   "tribal_playable_chiefs_lodge": 2,
+   "tribal_playable_confederation_of_tribes": 4,
+   "tribal_playable_council_of_elders": 1,
+   "tribal_playable_high_chiefs_lodge": 3
+  },
+  "sArmy": {
+   "army_barracks": 2,
+   "army_board": 4,
+   "army_encampment": 1,
+   "army_staff_college": 5,
+   "drill_school": 3,
+   "military_academy": 4,
+   "minor_governors_barracks": 2,
+   "minor_governors_encampment": 1,
+   "tribal_drill_grounds": 2,
+   "tribal_gunsmith": 3,
+   "tribal_horse_breeder": 2,
+   "tribal_hunting_grounds": 1,
+   "tribal_playable_drill_grounds": 2,
+   "tribal_playable_gunsmith": 3,
+   "tribal_playable_horse_breeder": 2,
+   "tribal_playable_hunting_grounds": 1,
+   "tribal_playable_practice_fields": 3,
+   "tribal_playable_warrior_lodge": 3,
+   "tribal_practice_fields": 3,
+   "tribal_warrior_lodge": 3
+  },
+  "sCannon": {
+   "cannon_foundry": 1,
+   "engineer_school": 5,
+   "great_arsenal": 3,
+   "gunnery_school": 3,
+   "ordnance_board": 4,
+   "ordnance_factory": 2
+  },
+  "sCulture": {
+   "conservatorium": 1,
+   "grand_opera_house": 3,
+   "great_museum": 4,
+   "opera_house": 2,
+   "royal_academy": 4,
+   "royal_observatory": 3,
+   "tribal_ancestral_ground": 1,
+   "tribal_burial_ground": 1,
+   "tribal_holy_ground": 2,
+   "tribal_playable_ancestral_ground": 1,
+   "tribal_playable_burial_ground": 1,
+   "tribal_playable_holy_ground": 2,
+   "tribal_playable_shamanic_gateway": 4,
+   "tribal_playable_spiritual_circle": 3,
+   "tribal_shamanic_gateway": 4,
+   "tribal_spiritual_circle": 3
+  },
+  "sFortifications": {
+   "improved_settlement_fortifications": 2,
+   "settlement_fortifications": 1
+  },
+  "sRoads": {
+   "basic_roads": 1,
+   "improved_roads": 2,
+   "tarmac_roads": 3
+  }
+ },
+ "town": {
+  "bawdy_house": [
+   "secret",
+   1
+  ],
+  "ceramics_factory": [
+   "commerce",
+   3
+  ],
+  "coaching_inn": [
+   "supply",
+   1
+  ],
+  "college": [
+   "edu",
+   1
+  ],
+  "craft_workshops_metal": [
+   "industry",
+   1
+  ],
+  "craft_workshops_pottery": [
+   "commerce",
+   1
+  ],
+  "craft_workshops_textiles": [
+   "commerce",
+   1
+  ],
+  "enlightened_university": [
+   "edu",
+   3
+  ],
+  "iron_workshops": [
+   "gun",
+   1
+  ],
+  "ironmasters_works": [
+   "gun",
+   2
+  ],
+  "kilns": [
+   "commerce",
+   2
+  ],
+  "pleasure_gardens": [
+   "secret",
+   3
+  ],
+  "pottery_workshops": [
+   "commerce",
+   1
+  ],
+  "school": [
+   "edu",
+   1
+  ],
+  "steam-powered_cloth_mill": [
+   "commerce",
+   3
+  ],
+  "steam_engine_factory": [
+   "industry",
+   3
+  ],
+  "theatre": [
+   "secret",
+   2
+  ],
+  "tribal_meeting_hall": [
+   "secret",
+   2
+  ],
+  "tribal_playable_craft_workshops_textiles": [
+   "commerce",
+   1
+  ],
+  "tribal_playable_iron_workshops": [
+   "gun",
+   1
+  ],
+  "tribal_playable_meeting_hall": [
+   "secret",
+   2
+  ],
+  "tribal_playable_village_longhouse": [
+   "secret",
+   1
+  ],
+  "tribal_playable_weavers_cottages": [
+   "commerce",
+   1
+  ],
+  "tribal_playble_craft_workshops_metal": [
+   "industry",
+   1
+  ],
+  "tribal_village_longhouse": [
+   "secret",
+   1
+  ],
+  "university": [
+   "edu",
+   2
+  ],
+  "water-powered_cloth_mill": [
+   "commerce",
+   2
+  ],
+  "weavers_cottages": [
+   "commerce",
+   1
+  ]
+ },
+ "town_chain": {
+  "commerce": {
+   "town-commercial": "tCommerce",
+   "town-industrial": "tFactory",
+   "town-intellectual": "tEducation"
+  },
+  "edu": {
+   "town-commercial": "tCommerce",
+   "town-industrial": "tFactory",
+   "town-intellectual": "tEducation"
+  },
+  "gun": {
+   "town-commercial": "tSupply",
+   "town-industrial": "tGuns",
+   "town-intellectual": "tSecret"
+  },
+  "industry": {
+   "town-commercial": "tCommerce",
+   "town-industrial": "tFactory",
+   "town-intellectual": "tEducation"
+  },
+  "religion": {
+   "town-commercial": "tSupply",
+   "town-industrial": "tGuns",
+   "town-intellectual": "tSecret"
+  },
+  "secret": {
+   "town-commercial": "tSupply",
+   "town-industrial": "tGuns",
+   "town-intellectual": "tSecret"
+  },
+  "supply": {
+   "town-commercial": "tSupply",
+   "town-industrial": "tGuns",
+   "town-intellectual": "tSecret"
+  }
+ },
+ "town_natural": {
+  "commerce": "town-commercial",
+  "edu": "town-intellectual",
+  "gun": "town-industrial",
+  "industry": "town-industrial",
+  "religion": "town-intellectual",
+  "secret": "town-intellectual",
+  "supply": "town-commercial"
+ },
+ "town_religion": {
+  "levels": 3,
+  "prefix": "rel_",
+  "religions": [
+   "catholic",
+   "hindu",
+   "islam",
+   "orthodox",
+   "protestant"
+  ]
+ }
+}
