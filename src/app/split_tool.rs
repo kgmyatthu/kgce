@@ -15,6 +15,7 @@ pub(super) enum MapTool {
     Select,
     Split,
     Activate,
+    Settlement,
 }
 
 /// The cut being drawn and the fields of the new region.
@@ -214,16 +215,13 @@ impl Editor {
     }
 
     pub(super) fn to_screen(&self, world: [f32; 2], rect: Rect) -> Pos2 {
-        let scale = self.scale(rect);
-        Pos2::new(
-            rect.center().x + (world[0] - self.center.x) * scale,
-            rect.center().y - (world[1] - self.center.y) * scale,
-        )
+        self.screen_display(self.display_point(world), rect)
     }
 
     /// Snap distance in world units: 2% of the visible map width.
     fn snap_radius(&self, rect: Rect) -> f64 {
         0.02 * f64::from(rect.width()) / f64::from(self.scale(rect))
+            / self.project.atlas.as_ref().map_or(1.0, |plan| plan.scale)
     }
 
     pub(super) fn leave_split_tool(&mut self) {
@@ -249,6 +247,7 @@ impl Editor {
                 self.leave_split_tool();
             } else {
                 self.leave_activate_tool();
+                self.leave_settlement_tool();
                 self.tool = MapTool::Split;
                 self.draft = SplitDraft::default();
                 self.push_message("Split tool: click the region to split.".into());
@@ -684,6 +683,7 @@ impl Editor {
         for key in &keys {
             next.owners.remove(key);
         }
+        next.settlement_moves.retain(|movement| !keys.contains(&movement.region));
         match self.install_project(next) {
             Ok(()) => {
                 self.dirty = true;

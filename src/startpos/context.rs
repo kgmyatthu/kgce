@@ -154,6 +154,10 @@ pub struct BuildContext<'a> {
     pub snapshot: &'a Snapshot,
     pub rules: &'a Rules,
     pub map: &'a crate::map::MapArtifacts,
+    /// root of the generated `campaign_maps/nap_world/sea_grids.esf`: the theatre rectangles and cell sizes of the
+    /// finished map. The CAI sea grid cell of every fleet is derived from it (never from the ETW original, whose
+    /// theatre grids the build moves)
+    pub sea_grids: &'a Node,
     /// keys of the activated wilderness regions and of the user's region splits: present in `rules.regions`, without a
     /// REGION record in the ETW start position
     pub added_keys: BTreeSet<String>,

@@ -44,6 +44,13 @@ pub(crate) const NTW_VANILLA_PACKS: [&str; 11] = [
     "variantmodels.pack",
     "variantmodels2.pack",
 ];
+/// Files that earlier editors captured into snapshots (the campaign-building shaders now ship with the
+/// editor, see `building_scale`). New imports no longer select them; a snapshot that still holds them stays
+/// valid and re-importing it is not refused for lacking them in the selection.
+const RETIRED_NTW_SOURCES: [&str; 2] = [
+    "fx/campaignbuilding.fx",
+    "fx/campaignbuilding_vertex.fx_fragment",
+];
 const NTW_REF_MAPS: [&str; 5] = [
     "nap_europe",
     "nap_egypt",
@@ -899,6 +906,56 @@ pub fn import_with_language(
     Snapshot::open(&dest)
 }
 
+/// Streams one source file into `dest` (which must not exist), hashing the source stream and the written
+/// copy and refusing any size or hash mismatch.
+fn copy_member(
+    scan: &Scan,
+    eff: &Eff,
+    game: Game,
+    path: &str,
+    dest: &Path,
+    buf: &mut [u8],
+) -> Result<FileEntry> {
+    fs::create_dir_all(dest.parent().unwrap())
+        .with_context(|| format!("create folder for {}", dest.display()))?;
+    let mut src = scan.open(eff)?;
+    let mut out = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+        .with_context(|| format!("create {}", dest.display()))?;
+    let mut h = Sha256::new();
+    let copied = pump(&mut src, Some(&mut out as &mut dyn Write), &mut h, buf)
+        .with_context(|| format!("copy {}", eff.stored))?;
+    if copied != eff.size {
+        bail!(
+            "{} {}: read {copied} bytes but the source declares {}; the installation changed or is damaged",
+            game.dir().to_uppercase(),
+            eff.stored,
+            eff.size
+        );
+    }
+    out.flush()?;
+    drop(out);
+    let sha = hex::encode(h.finalize());
+    let (copy_len, copy_sha) = hash_file(dest, buf)?;
+    if copy_len != copied || copy_sha != sha {
+        bail!(
+            "{} {}: copy hash {copy_sha} ({copy_len} bytes) differs from source hash {sha} ({copied} bytes)",
+            game.dir().to_uppercase(),
+            eff.stored
+        );
+    }
+    Ok(FileEntry {
+        game,
+        path: path.to_owned(),
+        stored: eff.stored.clone(),
+        size: copied,
+        sha256: sha,
+        origin: scan.origin(eff),
+    })
+}
+
 fn build_snapshot(
     staging: &Path,
     plan: &Plan,
@@ -917,46 +974,15 @@ fn build_snapshot(
                 path
             ));
         }
-        let scan = &scans[game.slot()];
         let dest = disk_path(staging, *game, path);
-        fs::create_dir_all(dest.parent().unwrap())
-            .with_context(|| format!("create folder for {}", dest.display()))?;
-        let mut src = scan.open(eff)?;
-        let mut out = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&dest)
-            .with_context(|| format!("create {}", dest.display()))?;
-        let mut h = Sha256::new();
-        let copied = pump(&mut src, Some(&mut out as &mut dyn Write), &mut h, &mut buf)
-            .with_context(|| format!("copy {}", eff.stored))?;
-        if copied != eff.size {
-            bail!(
-                "{} {}: read {copied} bytes but the source declares {}; the installation changed or is damaged",
-                game.dir().to_uppercase(),
-                eff.stored,
-                eff.size
-            );
-        }
-        out.flush()?;
-        drop(out);
-        let sha = hex::encode(h.finalize());
-        let (copy_len, copy_sha) = hash_file(&dest, &mut buf)?;
-        if copy_len != copied || copy_sha != sha {
-            bail!(
-                "{} {}: copy hash {copy_sha} ({copy_len} bytes) differs from source hash {sha} ({copied} bytes)",
-                game.dir().to_uppercase(),
-                eff.stored
-            );
-        }
-        files.push(FileEntry {
-            game: *game,
-            path: path.clone(),
-            stored: eff.stored.clone(),
-            size: copied,
-            sha256: sha,
-            origin: scan.origin(eff),
-        });
+        files.push(copy_member(
+            &scans[game.slot()],
+            eff,
+            *game,
+            path,
+            &dest,
+            &mut buf,
+        )?);
     }
 
     let mut indexes = Vec::new();
@@ -1009,6 +1035,7 @@ pub(crate) fn set_readonly(path: &Path) -> Result<()> {
 }
 
 /// An existing snapshot is accepted only if every selected source file hashes to what it recorded.
+/// Returns an error for any selected file the snapshot lacks.
 fn check_same_sources(
     snap: &Snapshot,
     plan: &Plan,
@@ -1016,7 +1043,7 @@ fn check_same_sources(
     progress: &Progress,
 ) -> Result<()> {
     let mut want: HashSet<(Game, &str)> = HashSet::new();
-    for (game, path, _) in plan {
+    for (game, path, _) in plan.iter() {
         want.insert((*game, path.as_str()));
         if !snap.inner.by_key.contains_key(&(*game, path.clone())) {
             bail!(
@@ -1026,7 +1053,8 @@ fn check_same_sources(
         }
     }
     for f in &snap.inner.manifest.files {
-        if !want.contains(&(f.game, f.path.as_str())) {
+        let retired = f.game == Game::Ntw && RETIRED_NTW_SOURCES.contains(&f.path.as_str());
+        if !retired && !want.contains(&(f.game, f.path.as_str())) {
             bail!(
                 "snapshot holds {} {}, which the installation no longer provides; refusing to overwrite (delete the snapshot folder to import again)",
                 f.game.dir(),
@@ -1888,6 +1916,51 @@ pub(crate) mod tests {
             import(&i.etw, &i.ntw, &i.dest, &quiet()).is_err(),
             "removing a relevant source file must be refused as well"
         );
+    }
+
+    #[test]
+    fn campaign_building_shaders_are_not_imported_and_old_snapshots_holding_them_stay_valid() {
+        let i = installs();
+        let top = b"top shader".to_vec();
+        put(&i.ntw, "fx/campaignbuilding.fx", &top);
+        put(&i.ntw, "fx/campaignbuilding_vertex.fx_fragment", b"vertex fragment");
+        let fresh = import(&i.etw, &i.ntw, &i.dest, &quiet()).unwrap();
+        assert!(!fresh.exists(Game::Ntw, "fx/campaignbuilding.fx"));
+        assert!(!fresh.exists(Game::Ntw, "fx/campaignbuilding_vertex.fx_fragment"));
+
+        // Rewrite the snapshot the way an earlier editor captured the same two installed files.
+        let mut manifest = fresh.manifest().clone();
+        let origin = manifest.files.iter().find(|f| f.game == Game::Ntw).unwrap().origin.clone();
+        for (path, data) in [
+            ("fx/campaignbuilding.fx", top.as_slice()),
+            ("fx/campaignbuilding_vertex.fx_fragment", b"vertex fragment".as_slice()),
+        ] {
+            let dest = disk_path(&i.dest, Game::Ntw, path);
+            put(&i.dest, &format!("ntw/{path}"), data);
+            set_readonly(&dest).unwrap();
+            manifest.files.push(FileEntry {
+                game: Game::Ntw,
+                path: path.to_owned(),
+                stored: path.to_owned(),
+                size: data.len() as u64,
+                sha256: hex::encode(Sha256::digest(data)),
+                origin: origin.clone(),
+            });
+        }
+        manifest.files.sort_by(|a, b| (a.game, &a.path).cmp(&(b.game, &b.path)));
+        let manifest_path = i.dest.join(MANIFEST);
+        unlock(&manifest_path);
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        set_readonly(&manifest_path).unwrap();
+
+        let old = import(&i.etw, &i.ntw, &i.dest, &quiet()).unwrap();
+        assert_eq!(old.read(Game::Ntw, "fx/campaignbuilding.fx").unwrap(), top);
+        assert_eq!(old.manifest().files.len(), fresh.manifest().files.len() + 2);
+        old.verify(&quiet()).unwrap();
+
+        // The installed shader is not selected, so its removal or change never matters to the import.
+        fs::remove_file(i.ntw.join("fx/campaignbuilding.fx")).unwrap();
+        import(&i.etw, &i.ntw, &i.dest, &quiet()).unwrap().verify(&quiet()).unwrap();
     }
 
     #[test]

@@ -1069,13 +1069,15 @@ pub fn faction_infos(rules: &Rules) -> Result<BTreeMap<String, FactionInfo>> {
 
 /// `edited_regions`: the generated `campaign_maps/nap_world/regions.esf` when it holds edited theatre rectangles (theatre
 /// extensions); the camera bounds (EPISODIC_RESTRICTIONS 9..12, `scripting.lua`) then follow those rectangles instead
-/// of the ETW originals.
+/// of the ETW originals. `sea_grids`: the generated `campaign_maps/nap_world/sea_grids.esf`, whose cell layout decides
+/// the CAI sea grid cell of every fleet.
 pub fn generate(
     snapshot: &Snapshot,
     rules: &Rules,
     map: &MapArtifacts,
     added_keys: &BTreeSet<String>,
     edited_regions: Option<&Node>,
+    sea_grids: &Node,
     progress: &Progress<'_>,
 ) -> Result<Generated> {
     let faction_keys = db_keys(snapshot, rules, map, CampaignTable::Factions, "key")?;
@@ -1175,6 +1177,7 @@ pub fn generate(
         snapshot,
         rules,
         map,
+        sea_grids,
         added_keys: added_keys.clone(),
         etw_model,
         ntw_model,

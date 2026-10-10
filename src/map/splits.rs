@@ -37,7 +37,8 @@ pub fn engine_split(split: &RegionSplit) -> Split {
 /// a later activation can follow the settled land of an earlier one), then every split. An activated wilderness
 /// region carries a settlement cloned from its donor, so a later split may cut it.
 pub fn apply_all(data: &mut RegionData, project: &Project) -> Result<()> {
-    chain::extend_and_clip(data)?;
+    chain::extend_for_project(data, project)?;
+    chain::clip(data)?;
     for (index, activation) in project.activations.iter().enumerate() {
         activate_with_geometry(data, activation)
             .with_context(|| format!("Activation #{} {} (donor {})", index + 1, activation.key, activation.donor))?;
@@ -46,6 +47,7 @@ pub fn apply_all(data: &mut RegionData, project: &Project) -> Result<()> {
         data.split(&engine_split(split))
             .with_context(|| format!("Split #{} {} (from {})", index + 1, split.key, split.source))?;
     }
+    crate::settlement::preview(data, &project.settlement_moves)?;
     Ok(())
 }
 
@@ -452,6 +454,7 @@ impl ActivationRemoval {
         for key in &self.keys {
             project.owners.remove(key);
         }
+        project.settlement_moves.retain(|movement| !self.keys.contains(&movement.region));
     }
 }
 

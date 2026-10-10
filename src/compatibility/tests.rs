@@ -246,11 +246,22 @@ fn port_collisions_distinguish_identical_from_conflicting_rows() {
     assert!(!effective::same_layout(&port, &other));
 }
 
+fn campaign_members(table: &str, a: &[(&str, i32)], b: &[(&str, i32)]) -> Vec<MemberRows> {
+    let mut members = vec![
+        member(&format!("db/{table}/a"), a),
+        member(&format!("db/{table}/b"), b),
+    ];
+    for m in &mut members {
+        m.table.name = table.into();
+    }
+    members
+}
+
 #[test]
-fn pass_through_conflicts_warn_without_removing_or_reordering_rows() {
+fn conflicts_in_tables_the_campaign_does_not_read_only_warn_and_change_nothing() {
     let project = Project::default();
     let mut st = State::new(&project);
-    let mut members = vec![
+    let members = vec![
         member(
             "db/demo_tables/a",
             &[("within", 1), ("within", 2), ("cross", 3)],
@@ -261,13 +272,9 @@ fn pass_through_conflicts_warn_without_removing_or_reordering_rows() {
         .iter()
         .map(|m| db::encode(&m.table).unwrap())
         .collect();
-    reconcile_duplicates(&mut st, "demo_tables", &mut members, None).unwrap();
-    assert_eq!(st.drafts.len(), 2);
-    assert!(
-        st.drafts
-            .iter()
-            .all(|d| d.severity == "warning" && d.choices.is_empty())
-    );
+    note_unread_duplicates(&mut st, "demo_tables", &members);
+    assert!(st.drafts.is_empty(), "nothing to decide, nothing to block");
+    assert!(st.warnings.iter().any(|w| w.starts_with("demo_tables:")));
     assert_eq!(
         members
             .iter()
@@ -279,24 +286,20 @@ fn pass_through_conflicts_warn_without_removing_or_reordering_rows() {
 }
 
 #[test]
-fn campaign_input_conflicts_inside_one_member_still_block_without_generated_rows() {
+fn a_conflict_inside_one_member_on_a_key_the_campaign_reads_blocks_without_a_choice() {
+    const TABLE: &str = "unit_stats_land_tables";
+    let consumed = Consumed {
+        units: BTreeSet::from(["unit".to_owned()]),
+        ..Consumed::default()
+    };
     let project = Project::default();
     let mut st = State::new(&project);
     let mut members = vec![member(
         "db/unit_stats_land_tables/data",
-        &[("unit", 160), ("unit", 200)],
+        &[("unit", 160), ("unit", 200), ("spare", 1), ("spare", 2)],
     )];
-    members[0].table.name = "unit_stats_land_tables".into();
-    let mut empty_table = members[0].table.clone();
-    empty_table.rows.clear();
-    let empty_port = content::PortTable::from_table(empty_table, "seed").unwrap();
-    reconcile_duplicates(
-        &mut st,
-        "unit_stats_land_tables",
-        &mut members,
-        Some(&empty_port),
-    )
-    .unwrap();
+    members[0].table.name = TABLE.into();
+    reconcile_duplicates(&mut st, TABLE, &mut members, &|id| consumed.reads(TABLE, id)).unwrap();
     assert_eq!(st.drafts.len(), 1);
     assert_eq!(st.drafts[0].severity, "blocker");
     assert!(!st.drafts[0].resolved);
@@ -305,25 +308,28 @@ fn campaign_input_conflicts_inside_one_member_still_block_without_generated_rows
 }
 
 #[test]
-fn campaign_input_member_choice_still_removes_only_conflicting_losing_rows() {
+fn a_member_choice_removes_only_the_losing_rows_of_keys_the_campaign_reads() {
+    const TABLE: &str = "unit_stats_land_tables";
+    let consumed = Consumed {
+        units: BTreeSet::from(["fusiliers".to_owned()]),
+        ..Consumed::default()
+    };
     let project = Project::default();
+    let mut members = campaign_members(
+        TABLE,
+        &[("fusiliers", 160), ("guards", 80)],
+        &[("fusiliers", 200), ("guards", 90)],
+    );
     let mut st = State::new(&project);
-    let mut members = vec![
-        member(
-            "db/unit_stats_land_tables/a",
-            &[("unit", 160), ("other", 80)],
-        ),
-        member("db/unit_stats_land_tables/b", &[("unit", 200)]),
-    ];
-    for m in &mut members {
-        m.table.name = "unit_stats_land_tables".into();
-    }
-    reconcile_duplicates(&mut st, "unit_stats_land_tables", &mut members, None).unwrap();
+    reconcile_duplicates(&mut st, TABLE, &mut members, &|id| consumed.reads(TABLE, id)).unwrap();
+    // `guards` conflicts as well, but the conversion never reads it: only `fusiliers` needs a decision
     assert_eq!(st.drafts.len(), 1);
     let draft = &st.drafts[0];
     assert_eq!(draft.severity, "blocker");
     assert!(!draft.resolved);
+    assert!(draft.detail.contains("fusiliers") && !draft.detail.contains("guards"));
     assert!(effective::rewrite(&members).unwrap().is_empty());
+
     let mut decided = project.clone();
     decided.resolutions.insert(
         draft.id.clone(),
@@ -333,7 +339,7 @@ fn campaign_input_member_choice_still_removes_only_conflicting_losing_rows() {
         },
     );
     let mut resolved = State::new(&decided);
-    reconcile_duplicates(&mut resolved, "unit_stats_land_tables", &mut members, None).unwrap();
+    reconcile_duplicates(&mut resolved, TABLE, &mut members, &|id| consumed.reads(TABLE, id)).unwrap();
     assert!(resolved.drafts[0].resolved);
     assert_eq!(members[0].removed, BTreeSet::from([0]));
     assert!(members[1].removed.is_empty());
@@ -342,61 +348,119 @@ fn campaign_input_member_choice_still_removes_only_conflicting_losing_rows() {
             .live_rows()
             .map(|(_, row)| row.clone())
             .collect::<Vec<_>>(),
-        vec![vec![Cell::Str("other".into()), Cell::I32(80)]]
+        vec![vec![Cell::Str("guards".into()), Cell::I32(80)]]
     );
 }
 
 #[test]
-fn empty_port_tables_preserve_conflicts_and_saved_choices_but_generated_rows_require_resolution() {
+fn only_conflicts_on_keys_of_generated_rows_need_a_decision_in_other_tables() {
     let project = Project::default();
     let members = vec![
-        member("db/demo_tables/a", &[("key", 1)]),
-        member("db/demo_tables/b", &[("key", 2)]),
+        member("db/demo_tables/a", &[("key", 1), ("spare", 1)]),
+        member("db/demo_tables/b", &[("key", 2), ("spare", 2)]),
     ];
-    let generated = content::PortTable::from_table(demo_table(&[("new", 3)]), "seed").unwrap();
-    let empty = content::PortTable::from_table(demo_table(&[]), "seed").unwrap();
-    let mut critical = State::new(&project);
+    let mut generated = State::new(&project);
     reconcile_duplicates(
-        &mut critical,
+        &mut generated,
         "demo_tables",
         &mut members.clone(),
-        Some(&generated),
+        &|id| id == "key",
     )
     .unwrap();
-    assert_eq!(critical.drafts.len(), 1);
-    let draft = &critical.drafts[0];
-    assert_eq!(draft.severity, "blocker");
-    assert!(!draft.resolved);
-    assert_eq!(draft.choices.len(), 2);
+    assert_eq!(generated.drafts.len(), 1);
+    assert_eq!(generated.drafts[0].severity, "blocker");
+    assert_eq!(generated.drafts[0].choices.len(), 2);
 
-    // Switching to a mode that emits no rows must not silently apply a previously saved winner.
-    let mut decided = project.clone();
-    decided.resolutions.insert(
-        draft.id.clone(),
-        Resolution {
-            input_hash: draft.hash.clone(),
-            choice: "member:db/demo_tables/b".into(),
-        },
-    );
-    let mut warning = State::new(&decided);
-    let mut preserved = members.clone();
-    reconcile_duplicates(&mut warning, "demo_tables", &mut preserved, Some(&empty)).unwrap();
-    assert_eq!(warning.drafts.len(), 1);
-    assert_eq!(warning.drafts[0].severity, "warning");
-    assert!(warning.drafts[0].choices.is_empty());
-    assert!(!warning.drafts[0].resolved);
-    assert!(effective::rewrite(&preserved).unwrap().is_empty());
-    assert_eq!(
-        decided.resolutions[&draft.id].choice,
-        "member:db/demo_tables/b"
-    );
+    let mut elsewhere = State::new(&project);
+    let mut kept = members.clone();
+    reconcile_duplicates(&mut elsewhere, "demo_tables", &mut kept, &|id| id == "new").unwrap();
+    assert!(elsewhere.drafts.is_empty());
+    assert!(effective::rewrite(&kept).unwrap().is_empty());
+}
 
-    // Switching back to generated rows restores the explicit, still input-bound choice.
-    let mut back = State::new(&decided);
-    reconcile_duplicates(&mut back, "demo_tables", &mut preserved, Some(&generated)).unwrap();
-    assert!(back.drafts[0].resolved);
-    assert_eq!(preserved[0].removed, BTreeSet::from([0]));
-    assert!(preserved[1].removed.is_empty());
+#[test]
+fn the_campaign_reads_only_the_rows_the_resolver_actually_uses_after_mappings_and_owners() {
+    let mut rules = recycle_rules(
+        json!({"france": {}, "prussia": {}}),
+        json!({"paris": {"owner": "france", "rebel_faction": "french_rebels"}}),
+        json!({
+            "france": [{"kind": "army", "region": "paris", "units": ["Stand_In"]}],
+            "prussia": [{"kind": "army", "region": "paris", "units": ["Prussian_Only"]}]
+        }),
+    );
+    rules.slot_types = json!({"a": "settlement", "b": "settlement_fortification"});
+    rules.buildings = json!({"etw_building": "level_1"});
+    rules.buildings_by_slot_type = json!({
+        "etw_building": {"settlement": "slot_default", "settlement_fortification": "fort_level"},
+        "etw_other": {"settlement": "other_default"}
+    });
+    let mut project = Project::default();
+    project.owners.insert("delhi".into(), "hessen".into());
+    project.mappings.factions.insert("france".into(), "gaul".into());
+    project.mappings.units.insert("Stand_In".into(), "Target_Unit".into());
+    project.mappings.buildings.insert("other_default".into(), "mapped_level".into());
+    // the target defines gaul, hessen and (as an unrelated faction) france, but not prussia
+    let existing = BTreeSet::from(["gaul".to_owned(), "hessen".to_owned(), "france".to_owned()]);
+    let consumed = Consumed::new(&rules, &project, &existing);
+    for (table, id, read) in [
+        ("factions_tables", "gaul", true),
+        ("factions_tables", "hessen", true),
+        // the default replaced by the mapping, and a faction nobody uses, are not read
+        ("factions_tables", "france", false),
+        ("factions_tables", "unrelated", false),
+        ("regions_tables", "paris", true),
+        ("regions_tables", "unrelated", false),
+        ("unit_stats_land_tables", "Target_Unit", true),
+        ("unit_stats_naval_tables", "Target_Unit", true),
+        ("unit_stats_land_tables", "Stand_In", false),
+        // the army of a faction the target does not define is omitted by the resolver
+        ("unit_stats_land_tables", "Prussian_Only", false),
+        ("units_to_exclusive_faction_permissions_tables", "Target_Unit\u{1f}gaul", true),
+        ("units_to_exclusive_faction_permissions_tables", "Stand_In\u{1f}gaul", false),
+        ("building_levels_tables", "slot_default", true),
+        ("building_levels_tables", "mapped_level", true),
+        ("building_levels_tables", "other_default", false),
+        // fortification slots never receive buildings, and rules.buildings values are only existence-checked
+        ("building_levels_tables", "fort_level", false),
+        ("building_levels_tables", "level_1", false),
+        // unit, technology and building-chain rows are only tested for existence
+        ("units_tables", "Target_Unit", false),
+        ("technologies_tables", "gaul", false),
+        ("building_chain_to_slots_tables", "slot_default", false),
+    ] {
+        assert_eq!(consumed.reads(table, id), read, "{table} {id}");
+    }
+}
+
+#[test]
+fn a_conflict_on_a_default_the_project_mapped_away_does_not_block() {
+    const TABLE: &str = "unit_stats_land_tables";
+    let rules = recycle_rules(
+        json!({"france": {}}),
+        json!({}),
+        json!({"france": [{"kind": "army", "region": "paris", "units": ["Stand_In"]}]}),
+    );
+    let existing = BTreeSet::from(["france".to_owned()]);
+    let conflicting = || {
+        campaign_members(TABLE, &[("Stand_In", 160), ("Target_Unit", 80)], &[("Stand_In", 200), ("Target_Unit", 90)])
+    };
+
+    let project = Project::default();
+    let consumed = Consumed::new(&rules, &project, &existing);
+    let mut unmapped = State::new(&project);
+    reconcile_duplicates(&mut unmapped, TABLE, &mut conflicting(), &|id| consumed.reads(TABLE, id)).unwrap();
+    assert_eq!(unmapped.drafts.len(), 1, "the stand-in is read by the starting army");
+    assert!(unmapped.drafts[0].detail.contains("Stand_In"));
+
+    let mut mapped = project.clone();
+    mapped.mappings.units.insert("Stand_In".into(), "Target_Unit".into());
+    let consumed = Consumed::new(&rules, &mapped, &existing);
+    let mut st = State::new(&mapped);
+    let mut members = conflicting();
+    reconcile_duplicates(&mut st, TABLE, &mut members, &|id| consumed.reads(TABLE, id)).unwrap();
+    assert_eq!(st.drafts.len(), 1, "only the mapped target is read now");
+    assert!(st.drafts[0].detail.contains("Target_Unit") && !st.drafts[0].detail.contains("Stand_In"));
+    assert!(effective::rewrite(&members).unwrap().is_empty());
 }
 
 #[test]
@@ -806,7 +870,7 @@ fn unchanged_target_references_do_not_expand_imports_but_generated_rows_require_
 }
 
 #[test]
-fn provided_reference_tables_still_reject_missing_keys() {
+fn a_dangling_reference_in_a_supplied_table_is_reported_but_never_blocks() {
     let (_installs, rules, base, _demo) = reference_scope_fixture();
     let mut provider = (*db::load_table(&base, Game::Ntw, &rules, "provider").unwrap()).clone();
     provider.rows[0][0] = Cell::Str("different".into());
@@ -824,11 +888,8 @@ fn provided_reference_tables_still_reject_missing_keys() {
     let project = Project::default();
     let mut st = State::new(&project);
     target_references(&mut st, &target, &base, &rules, &scan);
-    assert!(
-        st.drafts
-            .iter()
-            .any(|d| d.id == "reference:target:demo_tables" && d.severity == "blocker")
-    );
+    assert!(st.drafts.is_empty(), "no decision or blocker for a record the mod itself lacks");
+    assert!(st.warnings.iter().any(|w| w.contains("demo_tables")));
 }
 
 /// A TSV-dataset target with unchanged installed tables (unit stats, factions, an optional table) and two

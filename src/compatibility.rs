@@ -10,11 +10,13 @@
 //!   installed mod; they are conversion inputs, not a second database bundled with the port.
 //! * [`required_tables`] lists the tables the conversion needs, for the dataset import preview.
 //!
-//! The TSV dataset is authoritative: there is no fallback to the original game's rows. Database rows are reconciled
-//! separately from file order: every DB member of the dataset is decoded on its own. Duplicate keys with different
-//! content are never concatenated and left to the engine; they require an explicit, input-hash-bound choice that is
-//! applied by rewriting only the affected members (same path, in the generated pack). Nothing here claims that the
-//! result was played or that the installed mod packs are compatible.
+//! The TSV dataset is authoritative: there is no fallback to the original game's rows. This is not a validator of the
+//! mod: only what the campaign conversion reads or writes can block (campaign inputs, the keys of generated rows,
+//! their references, ownership, geometry and resources). Duplicate keys, unreadable or dangling rows and missing
+//! records of anything else are warnings; those rows stay untouched and are never exported. Duplicate keys with
+//! different content on a key the conversion reads are never concatenated and left to the engine; they require an
+//! explicit, input-hash-bound choice that is applied by rewriting only the affected members (same path, in the
+//! generated pack). Nothing here claims that the result was played or that the installed mod packs are compatible.
 
 mod effective;
 mod resources;
@@ -320,6 +322,9 @@ fn project_digest(project: &Project) -> String {
     if !project.splits.is_empty() {
         h.part(&serde_json::to_string(&project.splits).unwrap_or_default());
     }
+    h.part(&serde_json::to_string(&project.atlas).unwrap_or_default());
+    h.part(&project.building_scale.to_string());
+    h.part(&serde_json::to_string(&project.settlement_moves).unwrap_or_default());
     h.part("fixed-theatres");
     for (key, rect) in crate::regionmap::theatres::FIXED_BOUNDS {
         h.part(key);
@@ -627,29 +632,172 @@ fn reads_campaign_table(table: &str) -> bool {
         .any(|input| input.name() == table)
 }
 
-/// Resolve only tables whose values affect conversion. Input-only members remain byte-for-byte intact.
+/// Keys of the campaign inputs whose rows the conversion reads values from, derived the way the resolver applies the
+/// project to the world rules (`campaign_profile::resolve`):
+/// * factions: the target key of every world faction the target defines, and every chosen owner;
+/// * regions: the keys of the generated region rows (world and added regions);
+/// * units: the stand-ins of the starting armies of those factions, after the unit mappings;
+/// * building levels: the level of every building slot the converted world places, after the building mappings.
+///
+/// A key the project maps away (a default replaced by a mapping) is not read and is not listed. Every other key is at
+/// most tested for existence, so a conflicting duplicate of it cannot change what is generated.
+#[derive(Default)]
+struct Consumed {
+    factions: BTreeSet<String>,
+    regions: BTreeSet<String>,
+    units: BTreeSet<String>,
+    levels: BTreeSet<String>,
+}
+
+impl Consumed {
+    /// `existing_factions` are the keys of the target's faction rows: the resolver omits a world faction (and its
+    /// armies) the target does not define.
+    fn new(rules: &Rules, project: &Project, existing_factions: &BTreeSet<String>) -> Self {
+        let mappings = &project.mappings;
+        let mut out = Self::default();
+        let faction_of =
+            |key: &str| mappings.factions.get(key).cloned().unwrap_or_else(|| key.to_owned());
+
+        for key in object_keys(&rules.factions) {
+            let target = faction_of(key);
+            if existing_factions.contains(&target) {
+                out.factions.insert(target);
+            }
+        }
+        out.factions.extend(
+            project
+                .owners
+                .values()
+                .filter(|owner| existing_factions.contains(*owner))
+                .cloned(),
+        );
+
+        out.regions.extend(object_keys(&rules.regions).cloned());
+        out.regions
+            .extend(content::extra_regions(project).into_iter().map(|r| r.key));
+
+        for (source, list) in rules.armies.as_object().into_iter().flatten() {
+            let key = if rules.factions.get(source).is_some() {
+                faction_of(source)
+            } else {
+                source.clone()
+            };
+            if !out.factions.contains(&key) {
+                continue;
+            }
+            for army in list.as_array().into_iter().flatten() {
+                let units = army.get("units").and_then(Value::as_array).into_iter().flatten();
+                for unit in units.filter_map(Value::as_str) {
+                    out.units
+                        .insert(mappings.units.get(unit).cloned().unwrap_or_else(|| unit.to_owned()));
+                }
+            }
+        }
+
+        // Slot types that receive buildings (fortifications never do) and the level of each building in them.
+        let used_slots: BTreeSet<&str> = rules
+            .slot_types
+            .as_object()
+            .into_iter()
+            .flat_map(|m| m.values())
+            .filter_map(Value::as_str)
+            .filter(|slot| *slot != "settlement_fortification")
+            .collect();
+        let by_slot = rules.buildings_by_slot_type.as_object();
+        let etw_buildings: BTreeSet<&String> = rules
+            .buildings
+            .as_object()
+            .into_iter()
+            .flat_map(|m| m.keys())
+            .chain(by_slot.into_iter().flat_map(|m| m.keys()))
+            .collect();
+        for etw in etw_buildings {
+            if let Some(level) = mappings.buildings.get(etw.as_str()) {
+                out.levels.insert(level.clone());
+                continue;
+            }
+            let slots = by_slot.and_then(|m| m.get(etw)).and_then(Value::as_object);
+            for (slot, level) in slots.into_iter().flatten() {
+                if !used_slots.contains(slot.as_str()) {
+                    continue;
+                }
+                if let Some(level) = level.as_str() {
+                    out.levels.insert(
+                        mappings.buildings.get(level).cloned().unwrap_or_else(|| level.to_owned()),
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    /// Tables of which the conversion reads row values for some key (see [`Consumed::reads`]).
+    fn values_read(table: &str) -> bool {
+        matches!(
+            table,
+            "factions_tables"
+                | "regions_tables"
+                | "unit_stats_land_tables"
+                | "unit_stats_naval_tables"
+                | "units_to_exclusive_faction_permissions_tables"
+                | "building_levels_tables"
+                | "slots_art_tables"
+        )
+    }
+
+    /// Whether the conversion reads the value of the row of `table` with identity `id` (its key columns joined by
+    /// U+001F). Tables that are only tested for key existence (units, technologies, regions of the target,
+    /// building chains, building levels the rules do not name...) never decide anything by their row content.
+    fn reads(&self, table: &str, id: &str) -> bool {
+        let first = id.split('\u{1f}').next().unwrap_or_default();
+        match table {
+            "factions_tables" => self.factions.contains(id),
+            "regions_tables" => self.regions.contains(id),
+            "unit_stats_land_tables" | "unit_stats_naval_tables" => self.units.contains(id),
+            "units_to_exclusive_faction_permissions_tables" => self.units.contains(first),
+            "building_levels_tables" => self.levels.contains(id),
+            "slots_art_tables" => id
+                .split('\u{1f}')
+                .any(|part| crate::map::TEMPLATE_SLOT_TYPES.contains(&part)),
+            _ => false,
+        }
+    }
+}
+
+/// Conflicting duplicate keys of a table, or of keys, that the campaign does not read: reported, never decided.
+/// The members stay exactly as imported and are not exported.
+fn note_unread_duplicates(st: &mut State<'_>, table: &str, members: &[effective::MemberRows]) {
+    match effective::duplicates(table, members) {
+        Ok(dup) => {
+            let count = dup.within.len() + dup.cross.values().map(Vec::len).sum::<usize>();
+            if count > 0 {
+                st.warnings.push(format!(
+                    "{table}: {count} key(s) are defined with different content more than once. The campaign does not read this table's values; the rows stay exactly as imported and are not exported."
+                ));
+            }
+        }
+        Err(error) => st.warnings.push(format!(
+            "{table}: duplicate keys were not checked ({error:#}). The campaign does not read this table's values."
+        )),
+    }
+}
+
+/// Resolves conflicting duplicate keys the conversion depends on (`relevant(identity)`). A conflict of another key
+/// is only reported; members are rewritten only for an explicit, input-hash-bound choice between members.
 fn reconcile_duplicates(
     st: &mut State<'_>,
     table: &str,
     members: &mut [effective::MemberRows],
-    port: Option<&content::PortTable>,
+    relevant: &dyn Fn(&str) -> bool,
 ) -> Result<()> {
-    let required = reads_campaign_table(table) || port.is_some_and(|p| !p.table.rows.is_empty());
-    let policy = if required {
-        "This table supplies campaign state or receives converted rows, so conflicting definitions must be resolved."
-    } else {
-        "Warning only: this table does not supply campaign state or receive converted rows. Its imported rows remain unchanged for analysis and are not exported; the installed target mod supplies them. The engine's duplicate-key precedence is unverified."
-    };
+    const POLICY: &str = "The conversion reads this key, so its conflicting definitions must be resolved.";
     let dup = effective::duplicates(table, members)?;
-    if !required {
-        let count = dup.within.len() + dup.cross.values().map(Vec::len).sum::<usize>();
-        if count > 0 {
-            st.warnings.push(format!(
-                "{table}: {count} conflicting duplicate key(s) retained in the input catalog because this table does not supply campaign state or receive converted rows. These unchanged members are not exported; the installed target mod's duplicate-key precedence is unverified."
-            ));
-        }
-    }
+    let mut unrelated = 0usize;
     for conflict in &dup.within {
+        if !relevant(&conflict.id) {
+            unrelated += 1;
+            continue;
+        }
         let (m, _) = conflict.entries[0];
         let hash = {
             let mut h = Hasher::new("db-within");
@@ -659,29 +807,26 @@ fn reconcile_duplicates(
                 .part(&conflict.id);
             h.finish()
         };
-        let mut draft = Draft::blocker(
+        st.drafts.push(Draft::blocker(
             format!("db_key:{table}:within:{}", &hash[..8]),
             hash,
             "db_key",
             format!("Conflicting rows inside a member of {table}"),
             format!(
-                "Key {:?} has several definitions with different content, including conflicting rows inside one member. First occurrence: {} ({}). {policy}{}",
+                "Key {:?} has several definitions with different content, including conflicting rows inside one member. First occurrence: {} ({}). {POLICY} Repair the conflicting rows in the source TSV; choosing a member cannot resolve conflicts inside it.",
                 conflict.id.replace('\u{1f}', " / "),
                 members[m].path,
                 members[m].origin,
-                if required {
-                    " Repair the conflicting rows in the source TSV; choosing a member cannot resolve conflicts inside it."
-                } else {
-                    ""
-                },
             ),
-        );
-        if !required {
-            draft.severity = "warning";
-        }
-        st.drafts.push(draft);
+        ));
     }
     for (set, conflicts) in &dup.cross {
+        let (conflicts, ignored): (Vec<&effective::Conflict>, Vec<&effective::Conflict>) =
+            conflicts.iter().partition(|c| relevant(&c.id));
+        unrelated += ignored.len();
+        if conflicts.is_empty() {
+            continue;
+        }
         let mut set_hash = Hasher::new("db-set");
         let mut h = Hasher::new("db-key");
         h.part(table);
@@ -689,7 +834,7 @@ fn reconcile_duplicates(
             set_hash.part(&members[m].path);
             h.part(&members[m].path).part(&members[m].sha256);
         }
-        for c in conflicts {
+        for c in &conflicts {
             h.part(&c.id);
             for (m, r) in &c.entries {
                 h.part(&db::row_signature(&members[*m].table.rows[*r]));
@@ -701,7 +846,7 @@ fn reconcile_duplicates(
             "db_key",
             format!("Duplicate database keys in {table}"),
             format!(
-                "{} key(s) of {table} are defined with different content in {} active files: {}. Keys: {}. {policy}",
+                "{} key(s) of {table} are defined with different content in {} active files: {}. Keys: {}. {POLICY} Choose one member; conflicting rows in the other members are removed in the generated pack.",
                 conflicts.len(),
                 set.len(),
                 shown(
@@ -712,18 +857,6 @@ fn reconcile_duplicates(
                 shown(conflicts.iter().map(|c| c.id.replace('\u{1f}', " / ")), 10),
             ),
         );
-        if !required {
-            draft.severity = "warning";
-            if st.project.resolutions.contains_key(&draft.id) {
-                st.warnings.push(format!(
-                    "The stored choice for \"{}\" is not applied: this table is now preserved unchanged rather than reconciled.",
-                    draft.title,
-                ));
-            }
-            st.drafts.push(draft);
-            continue;
-        }
-        draft.detail.push_str(" Choose one member; conflicting rows in the other members are removed in the generated pack.");
         draft.choices = set
             .iter()
             .rev()
@@ -732,9 +865,15 @@ fn reconcile_duplicates(
         if let Some(choice) = st.decide(draft) {
             let path = choice.strip_prefix("member:").unwrap_or_default();
             if let Some(winner) = set.iter().copied().find(|m| members[*m].path == path) {
-                effective::keep_member(members, conflicts, winner);
+                let chosen: Vec<effective::Conflict> = conflicts.iter().map(|c| (*c).clone()).collect();
+                effective::keep_member(members, &chosen, winner);
             }
         }
+    }
+    if unrelated > 0 {
+        st.warnings.push(format!(
+            "{table}: {unrelated} further key(s) are defined with different content more than once. The campaign does not read their values; the rows stay exactly as imported and are not exported."
+        ));
     }
     Ok(())
 }
@@ -929,16 +1068,22 @@ fn evaluate(
     st.catalog.source_factions = source_factions;
     st.catalog.source_units = source_units;
     st.catalog.source_buildings = source_buildings;
-    let geometry = crate::map::region_source(&base).and_then(|(mut data, _)| {
-        crate::regionmap::chain::extend(&mut data).map(|_| ())
-    });
+    let geometry = project.validate_structure().and_then(|_| crate::map::region_source(&base))
+        .and_then(|(mut data, _)| crate::map::splits::apply_all(&mut data, project));
     if let Err(error) = geometry {
-        st.block("geometry:theatres", "geometry", "Fixed theatre bounds cannot be applied", format!("{error:#}"));
+        st.block("geometry:project", "geometry", "Project geometry cannot be applied", format!("{error:#}"));
     }
-    st.warnings.push(
-        "Theatre bounds are fixed: Europe unchanged, India through Thailand and Indonesia, \
-         America through Western Plains. The map grids and canvases use these bounds; this export has not been tested in game.".into()
-    );
+    st.warnings.push(if project.atlas.is_some() {
+        "Connected stock-Q20 atlas: 1.3516979217529297× with the proven theatre arrangement and Q12 camera edges. Europe and India remain connected. Arbitrary edited campaigns still require in-game validation.".into()
+    } else {
+        "Theatre bounds are fixed: Europe unchanged, India through Thailand and Indonesia, America through Western Plains. This export has not been tested in game.".into()
+    });
+    if let Err(error) = crate::building_scale::preflight(project.building_scale) {
+        st.block("resources:building-shaders", "resources", "Campaign building shaders are unavailable or incompatible", format!("{error:#}"));
+    }
+    if crate::building_scale::is_active(project.building_scale) {
+        st.warnings.push(format!("A separate movie pack scales campaign-building shader geometry to {}× in every campaign. Characters are unchanged; remove older building-scale packs before installing it.", project.building_scale));
+    }
     if !project.activations.is_empty() {
         st.warnings.push(format!(
             "{} wilderness region(s) will be activated in the generated map and start position: {}. The activated regions are static-checked only and have not been played.",
@@ -958,6 +1103,8 @@ fn evaluate(
     let mut dataset: Option<Dataset> = None;
     let mut effective = base.clone();
     let mut adapter: Option<BTreeMap<String, Vec<u8>>> = None;
+    // Tables the conversion reads or whose records the generated rows refer to (TSV targets only).
+    let mut requirements: Vec<Requirement> = Vec::new();
     match project.target_mode {
         TargetMode::Vanilla => {
             st.target_name = "Vanilla Napoleon".to_owned();
@@ -1024,15 +1171,10 @@ fn evaluate(
                 }
             }
             if !loaded.manifest.resources_reviewed {
-                let mut h = Hasher::new("resources-review");
-                h.part(&loaded.manifest.fingerprint);
-                st.drafts.push(Draft::blocker(
-                    "resources:unreviewed".into(),
-                    h.finish(),
-                    "resources",
-                    "Resources were not reviewed".into(),
-                    "TSV files contain no campaign, UI or script information. Confirm that you reviewed this: resources you do not supply use the original conversion templates, and already merged resources can be imported separately as an adapter. Import the dataset again with the resources-reviewed confirmation; no mod resource compatibility is claimed either way.".into(),
-                ));
+                // Acknowledging a limit changes no campaign input, so it never gates the export.
+                st.warnings.push(
+                    "TSV files contain no campaign, UI or script information: resources you do not supply (as an adapter) use the original conversion templates, and the mod's own assets must be installed separately. No mod resource compatibility is claimed.".into(),
+                );
             }
             effective = match loaded.effective_snapshot(&base) {
                 Ok(s) => s,
@@ -1059,17 +1201,22 @@ fn evaluate(
                 );
                 return st.conclude(assets, None);
             }
-            if effective
-                .names(Game::Ntw, "db/")
-                .iter()
-                .any(|n| n.rsplit('/').next() == Some(content::TABLE_FILE))
-            {
+            requirements = required_tables(&base, &rules0)?;
+            // A member named like the generated one only matters in a table the conversion reads or adds rows to.
+            let generated_tables: BTreeSet<String> = content::port_table_names()
+                .into_iter()
+                .chain(requirements.iter().map(|r| r.table.clone()))
+                .collect();
+            if effective.names(Game::Ntw, "db/").iter().any(|n| {
+                n.rsplit('/').next() == Some(content::TABLE_FILE)
+                    && n.split('/').nth(1).is_some_and(|t| generated_tables.contains(t))
+            }) {
                 st.block(
                     "target:generated_members",
                     "target",
                     "Dataset already contains generated database members",
                     format!(
-                        "The dataset holds database members named {} (an earlier export of this tool). Export the mod's own tables without that earlier export and import the dataset again.",
+                        "The dataset holds database members named {} in tables the campaign uses (an earlier export of this tool). Export the mod's own tables without that earlier export and import the dataset again.",
                         content::TABLE_FILE
                     ),
                 );
@@ -1127,7 +1274,7 @@ fn evaluate(
     let modded = dataset.is_some();
 
     // ---- the dataset must provide every table and text file the conversion reads (no vanilla fallback)
-    if modded && !dataset_complete(&mut st, &effective, &base, &rules0)? {
+    if modded && !dataset_complete(&mut st, &effective, &requirements) {
         return st.conclude(assets, None);
     }
 
@@ -1138,7 +1285,29 @@ fn evaluate(
     } else {
         effective::Scan::default()
     };
+    let needed: BTreeSet<String> = requirements
+        .iter()
+        .map(|r| r.table.clone())
+        .chain(content::port_table_names())
+        .collect();
     for problem in &scan.schema {
+        if !needed.contains(&problem.table) {
+            st.warnings.push(format!(
+                "Table {} cannot be read and is left out of the analysis; the campaign does not use it. {}",
+                problem.table, problem.detail
+            ));
+            continue;
+        }
+        if problem.identity_only
+            && !Consumed::values_read(&problem.table)
+            && !content::port_table_names().contains(&problem.table)
+        {
+            st.warnings.push(format!(
+                "{} The conversion only tests this table for existing keys, so this does not block it.",
+                problem.detail
+            ));
+            continue;
+        }
         let mut h = Hasher::new("schema");
         h.part(&problem.table).part(&problem.detail);
         st.drafts.push(Draft::blocker(
@@ -1164,11 +1333,13 @@ fn evaluate(
             }
         }
     }
-    // Resolve campaign inputs before loading mappings or deriving port rows.
-    // Other tables are classified after staging, when actual generated rows are known.
+    // Resolve conflicts in campaign inputs before loading mappings or deriving port rows; only keys whose values
+    // the conversion reads can block. Other tables are classified after staging, when the generated rows are known.
+    let consumed = Consumed::new(&rules0, project, &st.scanned_factions);
     for (table, members) in &mut scan.tables {
         if reads_campaign_table(table) {
-            reconcile_duplicates(&mut st, table, members, None)?;
+            let table: &str = table;
+            reconcile_duplicates(&mut st, table, members, &|id| consumed.reads(table, id))?;
         }
     }
 
@@ -1230,8 +1401,16 @@ fn evaluate(
         }
     };
     for (table, members) in &mut scan.tables {
-        if !reads_campaign_table(table) {
-            reconcile_duplicates(&mut st, table, members, port.tables.get(table))?;
+        if reads_campaign_table(table) {
+            continue;
+        }
+        match port.tables.get(table) {
+            Some(pt) if !pt.table.rows.is_empty() => {
+                let generated: BTreeSet<String> =
+                    pt.table.rows.iter().map(|row| pt.identity_of(row)).collect();
+                reconcile_duplicates(&mut st, table, members, &|id| generated.contains(id))?;
+            }
+            _ => note_unread_duplicates(&mut st, table, members),
         }
     }
     let mut keep_target_tables: BTreeSet<String> = BTreeSet::new();
@@ -1573,7 +1752,7 @@ fn evaluate(
     let mut loc_decided = BTreeSet::new();
     let loc_vanilla_english = english(base.language()) && (!modded || english(&st.language));
     if modded {
-        target_loc_members(&mut st, &snapshot, &mut loc_strip)?;
+        target_loc_members(&mut st, &snapshot, &loc_plan, &mut loc_strip)?;
     }
     if modded || !english(base.language()) {
         let mut conflicts =
@@ -1815,9 +1994,9 @@ impl State<'_> {
     }
 }
 
-/// Check supplied rows against supplied reference tables after decisions. Pre-existing original inconsistencies
-/// are ignored. Omitted reference tables remain unverified rather than becoming import requirements; direct
-/// campaign reads and references of generated rows are validated separately.
+/// Reports dangling references in supplied target rows as warnings. The conversion is not a validator of the mod:
+/// pre-existing original inconsistencies are left out, references into omitted tables stay unverified, and nothing
+/// here blocks; the references the campaign depends on (generated rows, rules, mappings) are checked separately.
 fn target_references(
     st: &mut State<'_>,
     snapshot: &Snapshot,
@@ -1833,25 +2012,18 @@ fn target_references(
             }
             Ok(None) => {}
             Err(error) => {
-                st.block(
-                    &format!("reference:target:{name}"),
-                    "reference",
-                    &format!("Table {name} cannot be checked"),
-                    format!("{error:#}"),
-                );
-                return;
+                st.warnings.push(format!(
+                    "Table {name} was not checked for dangling references: {error:#}"
+                ));
             }
         }
     }
     let report = match content::reference_problems(snapshot, rules, &tables, true) {
         Ok(r) => r,
         Err(error) => {
-            st.block(
-                "reference:target",
-                "reference",
-                "Target rows cannot be checked",
-                format!("{error:#}"),
-            );
+            st.warnings.push(format!(
+                "Target rows were not checked for dangling references: {error:#}"
+            ));
             return;
         }
     };
@@ -1871,12 +2043,9 @@ fn target_references(
             }) {
             Ok(report) => report.problems.into_iter().collect(),
             Err(error) => {
-                st.block(
-                    "reference:baseline",
-                    "reference",
-                    "The original reference data cannot be compared",
-                    format!("{error:#}"),
-                );
+                st.warnings.push(format!(
+                    "Target rows were not checked for dangling references: the original reference data cannot be compared ({error:#})"
+                ));
                 return;
             }
         }
@@ -1891,21 +2060,10 @@ fn target_references(
         by_table.entry(table).or_default().push(problem);
     }
     for (table, problems) in by_table {
-        let mut h = Hasher::new("target-refs");
-        h.part(&table);
-        for p in &problems {
-            h.part(p);
-        }
-        st.drafts.push(Draft::blocker(
-            format!("reference:target:{table}"),
-            h.finish(),
-            "reference",
-            format!("Target rows in {table} refer to missing records"),
-            format!(
-                "{} dangling reference(s) in the dataset, for example: {}. The dataset's tables must be consistent with each other; repair the data in the mod, export the TSV again and import it.",
-                problems.len(),
-                problems.iter().take(8).cloned().collect::<Vec<_>>().join("; ")
-            ),
+        st.warnings.push(format!(
+            "Rows of {table} in the dataset refer to missing records ({} reference(s), for example: {}). The campaign does not read them; the rows stay exactly as imported and are not exported.",
+            problems.len(),
+            problems.iter().take(5).cloned().collect::<Vec<_>>().join("; ")
         ));
     }
     if report.unverified > 0 {
@@ -1960,17 +2118,12 @@ pub fn required_tables(base: &Snapshot, rules: &Rules) -> Result<Vec<Requirement
 }
 
 /// Blocks on every required table or text file the dataset does not contain. Returns whether everything is there.
-fn dataset_complete(
-    st: &mut State<'_>,
-    effective: &Snapshot,
-    base: &Snapshot,
-    rules: &Rules,
-) -> Result<bool> {
+fn dataset_complete(st: &mut State<'_>, effective: &Snapshot, requirements: &[Requirement]) -> bool {
     let present: BTreeSet<String> = db::table_directory(effective, Game::Ntw)
         .into_keys()
         .collect();
     let mut complete = true;
-    for req in required_tables(base, rules)? {
+    for req in requirements {
         if present.contains(&req.table) {
             continue;
         }
@@ -1997,7 +2150,7 @@ fn dataset_complete(
             );
         }
     }
-    Ok(complete)
+    complete
 }
 
 /// One text key with the definitions the dataset's text members give it: `(member, (text, tooltip))`.
@@ -2017,11 +2170,13 @@ fn loc_groups(by_key: BTreeMap<String, LocDefs>) -> BTreeMap<Vec<String>, Vec<(S
     groups
 }
 
-/// Text members of the dataset: a key repeated inside one member, or defined differently by several members,
-/// needs an explicit decision (the other members are rewritten without the key at their original path).
+/// Text members of the dataset: a key the conversion writes that is repeated inside one member, or defined
+/// differently by several members, needs an explicit decision (the other members are rewritten without the key at
+/// their original path). Repeated or differing definitions of any other key are the mod's own and stay untouched.
 fn target_loc_members(
     st: &mut State<'_>,
     snapshot: &Snapshot,
+    plan: &content::LocPlan,
     strip: &mut BTreeMap<String, BTreeSet<String>>,
 ) -> Result<()> {
     let main = content::loc_main_paths();
@@ -2059,16 +2214,16 @@ fn target_loc_members(
                 }
             }
         }
-        // the two main files are merged into full files, which cannot hold a key twice
-        let bad = if main.contains(&name) {
-            &repeated
-        } else {
-            &differing
-        };
+        // the two main files are merged into full files, which cannot hold a written key twice
+        let repeated_here = if main.contains(&name) { &repeated } else { &differing };
+        let bad: BTreeSet<&String> = repeated_here
+            .iter()
+            .filter(|key| plan.contains(key))
+            .collect();
         if !bad.is_empty() {
             let mut h = Hasher::new("loc-within");
             h.part(&name);
-            for key in bad {
+            for key in &bad {
                 h.part(key);
             }
             st.drafts.push(Draft::blocker(
@@ -2079,12 +2234,14 @@ fn target_loc_members(
                 format!(
                     "{name} defines {} key(s) more than once: {}. The engine's choice between repeated keys is unknown; remove the repeated rows in the mod, export the TSV again and import it.",
                     bad.len(),
-                    shown(bad.iter().cloned(), 10)
+                    shown(bad.iter().map(|k| (*k).clone()), 10)
                 ),
             ));
         }
         for (key, value) in seen {
-            by_key.entry(key).or_default().push((name.clone(), value));
+            if plan.contains(&key) {
+                by_key.entry(key).or_default().push((name.clone(), value));
+            }
         }
     }
     for (members, items) in loc_groups(by_key) {

@@ -1,0 +1,81 @@
+#ifdef NO_INSTANCING
+#define VERTEX_TYPE VS_INPUT_TEXTURED
+#define VERTEX_SHADER_NAME			textured_vertex
+#define SHADOW_VERTEX_SHADER_NAME	shadow_textured_vertex
+#define DEPTH_VERTEX_SHADER_NAME	depth_textured_vertex
+#elif defined (INSTANCING)
+#define VERTEX_TYPE VS_INPUT_TEXTURED_INSTANCED
+#define VERTEX_SHADER_NAME textured_vertex_instanced
+#define SHADOW_VERTEX_SHADER_NAME shadow_textured_vertex_instanced
+#define DEPTH_VERTEX_SHADER_NAME depth_textured_vertex_instanced
+#elif defined (INSTANCING_30)
+#define VERTEX_TYPE VS_INPUT_TEXTURED_INSTANCED_30
+#define VERTEX_SHADER_NAME textured_vertex_instanced_30
+#define SHADOW_VERTEX_SHADER_NAME shadow_textured_vertex_instanced_30
+#define DEPTH_VERTEX_SHADER_NAME depth_textured_vertex_instanced_30
+#endif
+
+#include "matrix_retreval.fx_fragment"
+
+
+VS_OUTPUT_TEXTURED VERTEX_SHADER_NAME(const VERTEX_TYPE v)
+{
+    VS_OUTPUT_TEXTURED r;
+
+	int i = calculate_instance_idx(v);
+	float4x4 instance_world					= get_world_matrix(v,i);
+
+	float3 normal							= normalize(mul(packed_normal_to_vector(v.normal), (float3x3)instance_world));
+	r.normal = normal;
+	
+	float4 world_position					= mul(float4(v.position,1), instance_world);
+	r.position								= mul(world_position, view_projection);
+	r.world_position.xyz					= world_position.xyz;
+	r.world_position.w						= calc_shadow_distance( world_position.xyz, camera_position );
+
+	r.texture_uv							= v.texture_uv;
+
+	r.shadow								= shadow_map_occlusion_vertex(float4(r.world_position.xyz, 1));
+
+	r.diffuse_color						= directional_lighting_colour(normal);
+	r.ambient_color						= ambient_lighting_colour(normal);
+
+	return r;
+}
+
+VS_SHADOW_MAP_WITH_ALPHA_MAP_OUTPUT SHADOW_VERTEX_SHADER_NAME(const VERTEX_TYPE v)
+{
+    VS_SHADOW_MAP_WITH_ALPHA_MAP_OUTPUT r;
+
+	int i = calculate_instance_idx(v);
+	float4x4 instance_world					= get_world_matrix(v,i);
+
+	float4 world_position					= mul(float4(v.position,1), instance_world);
+
+	shadow_map_projection(world_position,r.distance, r.position);
+	r.tex_uv = v.texture_uv;
+	r.alpha = 1;
+
+	return r;
+}
+
+VS_DEPTH_BUFFER_OUTPUT_WITH_TEXTURE DEPTH_VERTEX_SHADER_NAME(const VERTEX_TYPE v)
+{
+    VS_DEPTH_BUFFER_OUTPUT_WITH_TEXTURE r;
+
+	int i = calculate_instance_idx(v);
+	float4x4 instance_world					= get_world_matrix(v,i);
+
+	float4 world_position					= mul(float4(v.position,1), instance_world);
+
+	r.position			= mul(world_position, view_projection);
+	r.worldview_position = mul(world_position, view_matrix);
+	r.tex_uv			= v.texture_uv; 
+
+	return r;
+}
+
+#undef VERTEX_TYPE
+#undef VERTEX_SHADER_NAME
+#undef SHADOW_VERTEX_SHADER_NAME
+#undef DEPTH_VERTEX_SHADER_NAME

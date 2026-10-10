@@ -1,7 +1,6 @@
-//! Effective target database: every DB member of the TSV dataset is decoded separately. Conflicting keys in
-//! campaign inputs or tables receiving converted rows require resolution; an explicit member choice removes only
-//! the losing rows. Untouched tables outside those inputs retain their conflicting rows with warnings. Original
-//! member paths and row order are preserved.
+//! Effective target database: every DB member of the TSV dataset is decoded separately. Conflicting keys the
+//! conversion reads or writes require resolution; an explicit member choice removes only the losing rows. All other
+//! rows, including conflicting ones, stay untouched. Original member paths and row order are preserved.
 
 use crate::{
     content::{self, PortTable},
@@ -37,6 +36,9 @@ impl MemberRows {
 pub struct SchemaProblem {
     pub table: String,
     pub detail: String,
+    /// Only conflicting rows between members cannot be detected; the table itself is readable. Matters only to
+    /// tables whose row values the conversion reads or whose rows it must not collide with.
+    pub identity_only: bool,
 }
 
 #[derive(Debug, Default)]
@@ -95,6 +97,7 @@ pub fn scan_tables(
                 out.schema.push(SchemaProblem {
                     table: dir,
                     detail: format!("{error:#}"),
+                    identity_only: false,
                 });
                 continue;
             }
@@ -106,6 +109,7 @@ pub fn scan_tables(
             {
                 out.schema.push(SchemaProblem {
                     table: dir.clone(),
+                    identity_only: true,
                     detail: format!(
                         "{dir} is split over {} TSV files and differs from the original game's table, but it has no supported row-key definition in the schema; conflicting rows between the files cannot be detected. Export the table as one TSV file.",
                         decoded.len()
@@ -119,6 +123,7 @@ pub fn scan_tables(
             }) {
                 out.schema.push(SchemaProblem {
                     table: dir.clone(),
+                    identity_only: false,
                     detail: format!(
                         "members {} (version {}) and {} (version {}) of {dir} have different schema versions or fields; the engine cannot merge them",
                         first.path, first.table.version, other.path, other.table.version

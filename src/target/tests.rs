@@ -637,3 +637,85 @@ fn required_only_imports_drop_optional_tables_and_ignore_them_as_drift() {
     let changes = dataset.changes().unwrap();
     assert!(changes.iter().any(|c| c.contains("more")), "{changes:?}");
 }
+
+const DEMO_SCHEMA: &str = r#"(
+    version: 1,
+    definitions: {
+        "demo_tables": [(
+            version: 1,
+            fields: [
+                (name: "key", field_type: StringU8, is_key: true, is_reference: None),
+                (name: "n", field_type: I32, is_key: false, is_reference: None),
+            ],
+        )],
+        "other_tables": [(
+            version: 1,
+            fields: [
+                (name: "key", field_type: StringU8, is_key: true, is_reference: None),
+                (name: "n", field_type: I32, is_key: false, is_reference: None),
+            ],
+        )],
+    },
+)"#;
+
+fn raw(rel: &str, text: &str) -> RawFile {
+    RawFile {
+        rel: rel.to_owned(),
+        bytes: text.as_bytes().to_vec(),
+    }
+}
+
+#[test]
+fn unreadable_or_repeated_files_of_tables_the_campaign_does_not_read_never_block_the_import() {
+    let schema = db::Schema::parse(DEMO_SCHEMA).unwrap();
+    let required = BTreeSet::from(["demo_tables".to_owned()]);
+    let shared = "key\tn\n#other_tables;1;db/other_tables/shared\na\t1\n";
+    let files = vec![
+        raw("demo_tables/m.tsv", "key\tn\n#demo_tables;1;db/demo_tables/m\na\t1\n"),
+        raw(
+            "other_tables/broken.tsv",
+            "key\tn\n#other_tables;1;db/other_tables/broken\na\tnot a number\n",
+        ),
+        raw("other_tables/one.tsv", shared),
+        raw("other_tables/two.tsv", shared),
+    ];
+    let (mut problems, mut notes) = (Vec::new(), Vec::new());
+    let kept = interpret(files, &schema, &required, &mut problems, &mut notes);
+    assert!(problems.is_empty(), "{problems:?}");
+    assert_eq!(
+        kept.iter().map(|e| e.member.as_str()).collect::<Vec<_>>(),
+        ["db/demo_tables/m"]
+    );
+    assert_eq!(notes.len(), 2, "{notes:?}");
+}
+
+#[test]
+fn unreadable_or_repeated_files_of_required_tables_still_block_the_import() {
+    let schema = db::Schema::parse(DEMO_SCHEMA).unwrap();
+    let required = BTreeSet::from(["demo_tables".to_owned()]);
+    let (mut problems, mut notes) = (Vec::new(), Vec::new());
+    let kept = interpret(
+        vec![raw(
+            "demo_tables/m.tsv",
+            "key\tn\n#demo_tables;1;db/demo_tables/m\na\tnot a number\n",
+        )],
+        &schema,
+        &required,
+        &mut problems,
+        &mut notes,
+    );
+    assert!(kept.is_empty());
+    assert_eq!(problems.len(), 1, "{problems:?}");
+
+    let same = "key\tn\n#demo_tables;1;db/demo_tables/m\na\t1\n";
+    let mut problems = Vec::new();
+    interpret(
+        vec![raw("demo_tables/m.tsv", same), raw("demo_tables/copy.tsv", same)],
+        &schema,
+        &required,
+        &mut problems,
+        &mut notes,
+    );
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(notes.is_empty());
+}

@@ -23,7 +23,9 @@ pub type Progress<'a> = dyn Fn(&str) + Send + Sync + 'a;
 /// * v9 fixes the theatre bounds (see `regionmap::theatres`): the `theatres` option is gone. A v8 project's custom
 ///   rectangles are dropped in memory when it is read — every other decision survives — and the file itself is
 ///   rewritten without the obsolete option only when the user saves.
-pub const PROJECT_FORMAT: u32 = 9;
+/// * v10 saves the complete connected-atlas contract, building shader scale and settlement destinations.
+///   Earlier projects retain their original map layout and building size until the preset is explicitly applied.
+pub const PROJECT_FORMAT: u32 = 10;
 
 /// Which database the converter ports into.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -317,7 +319,18 @@ pub struct Project {
     /// by `tools/terrain_paint`), imported over the generated canvases
     #[serde(default)]
     pub painted_terrain: Option<PathBuf>,
+    /// Complete supported affine/crop contract, saved for reproducible exports.
+    #[serde(default)]
+    pub atlas: Option<crate::atlas::Plan>,
+    /// Campaign-building shader scale only; characters and world positions are unchanged.
+    #[serde(default = "unit_scale")]
+    pub building_scale: f32,
+    /// Stable region/slot destinations in source coordinates, applied before the atlas.
+    #[serde(default)]
+    pub settlement_moves: Vec<crate::settlement::Move>,
 }
+
+fn unit_scale() -> f32 { 1.0 }
 
 impl Default for Project {
     fn default() -> Self {
@@ -334,6 +347,9 @@ impl Default for Project {
             splits: Vec::new(),
             terrain: TerrainRelief::default(),
             painted_terrain: None,
+            atlas: None,
+            building_scale: 1.0,
+            settlement_moves: Vec::new(),
         }
     }
 }
@@ -360,7 +376,7 @@ impl Project {
             .and_then(Value::as_u64)
             .context("Project file has no format_version")?;
         match version {
-            1 | 3 | 4 | 5 | 6 | 7 | 8 => {}
+            1 | 3 | 4 | 5 | 6 | 7 | 8 | 9 => {}
             2 => migrate_v2(&mut value)?,
             v if v == u64::from(PROJECT_FORMAT) => {}
             other => bail!(
@@ -383,6 +399,11 @@ impl Project {
     /// combine (see [`RegionActivation::validate_options`]). That an area index exists is checked against the map
     /// when the project is built.
     pub fn validate_structure(&self) -> Result<()> {
+        if let Some(plan) = &self.atlas {
+            plan.validate()?;
+        }
+        crate::building_scale::validate_scale(self.building_scale)?;
+        crate::settlement::validate_structure(&self.settlement_moves)?;
         for (index, activation) in self.activations.iter().enumerate() {
             if self.activations[..index].iter().any(|other| other.key == activation.key) {
                 bail!("Region {} is activated twice", activation.key);
@@ -1017,6 +1038,29 @@ mod tests {
             a.carve_from = Some("unexplorable".into());
             a.areas = AreaSelection::Indices(vec![31]);
         })));
+    }
+
+    #[test]
+    fn saved_spatial_edits_survive_reload_without_rescaling_destinations() {
+        let mut project = Project::parse(br#"{"format_version":9,"name":"Campaign","owners":{"corsica":"britain"}}"#).unwrap();
+        assert!(project.atlas.is_none());
+        assert_eq!(project.building_scale, 1.0);
+        project.atlas = Some(crate::atlas::Plan::proven());
+        project.building_scale = 0.5;
+        project.settlement_moves.push(crate::settlement::Move {
+            region: "corsica".into(), slot: "ajaccio".into(), position: [63.125, 244.75],
+        });
+        let back = Project::parse(&serde_json::to_vec_pretty(&project).unwrap()).unwrap();
+        assert_eq!(back.atlas, project.atlas);
+        assert_eq!(back.building_scale, 0.5);
+        assert_eq!(back.settlement_moves, project.settlement_moves);
+        assert_eq!(back.owners["corsica"], "britain");
+        let mut duplicate = back.clone();
+        duplicate.settlement_moves.push(back.settlement_moves[0].clone());
+        assert!(Project::parse(&serde_json::to_vec(&duplicate).unwrap()).is_err());
+        let mut unsupported = back;
+        unsupported.atlas.as_mut().unwrap().charts[0].offset[0] += 1.0;
+        assert!(Project::parse(&serde_json::to_vec(&unsupported).unwrap()).is_err());
     }
 
     #[test]

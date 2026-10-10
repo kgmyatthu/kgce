@@ -104,7 +104,7 @@ fn generate_into(
     let data = destination.join("data");
     fs::create_dir_all(&data)?;
     progress("Converting world geography and terrain from ETW originals");
-    let mut map = map::build(source, rules, &data, &project.terrain, progress)?;
+    let mut map = map::build(source, rules, &data, &project.terrain, project.atlas.is_none(), progress)?;
     let world_dir = data.join("campaign_maps/nap_world");
     // Format-9 chain: fixed theatre bounds, clipping, area selection / merge / carve. It always runs: the fixed
     // geometry applies to every build, with or without activations or splits.
@@ -180,6 +180,7 @@ fn generate_into(
         )?);
     }
     warnings.extend(rebuild_hlcis(&startpos_path, &world_dir, project, &stage, progress)?);
+    warnings.extend(crate::settlement::apply(&data, &project.settlement_moves, &mut map, progress)?);
     progress("Checking the generated map and start position against each other");
     check_world(&world_dir, &startpos_path, project, &stage, &touched)?;
     progress("Encoding Napoleon database tables and localisation");
@@ -192,10 +193,45 @@ fn generate_into(
     {
         fs::write(data.join("campaigns/wld_napoleon/scripting.lua"), script)?;
     }
+    let atlas_report = if let Some(plan) = &project.atlas {
+        progress("Repacking the proven connected stock-Q20 campaign atlas");
+        let geography = crate::atlas::geography::transform(&data, plan, progress)?;
+        let display = crate::atlas::display::transform(&data, plan, progress)?;
+        let campaign = crate::atlas::campaign::transform(&data, plan, &geography, progress)?;
+        let schema = crate::db::schema(rules, crate::snapshot::Game::Ntw)?;
+        let tables = crate::atlas::campaign::transform_members(&mut members, &schema, plan)?;
+        crate::atlas::campaign::transform_trade_nodes(&mut map, plan)?;
+        let start = esf::read(&fs::read(&startpos_path).context("Read the atlas startpos.esf")?)?;
+        let problems = navigation_problems(&world_dir, &start.root)?;
+        if !problems.is_empty() {
+            bail!(
+                "The atlas navigation and start position are inconsistent ({} problems):\n  {}",
+                problems.len(),
+                problems.iter().take(40).cloned().collect::<Vec<_>>().join("\n  ")
+            );
+        }
+        Some(serde_json::json!({
+            "plan": plan,
+            "regions": geography.contract,
+            "navigation_point_overrides": geography.point_overrides,
+            "geography": geography.report,
+            "trade_nodes": map.trade_nodes,
+            "display": display,
+            "campaign": campaign,
+            "tables": tables,
+        }))
+    } else { None };
+    let building_report = crate::building_scale::export(&data, project.building_scale)?;
     pack::write_pack(&data.join(&prepared.pack_name), &members, 4)?;
     progress("Inspecting generated campaign ownership and required output files");
     validate_output(&data, rules, &prepared.pack_name, &members)?;
-    let metadata = export_metadata(prepared, project)?;
+    let mut metadata = export_metadata(prepared, project)?;
+    if let Some(report) = atlas_report {
+        metadata.insert("atlas.json".into(), serde_json::to_vec_pretty(&report)?);
+    }
+    if let Some(report) = building_report {
+        metadata.insert("building-scale.json".into(), serde_json::to_vec_pretty(&report)?);
+    }
     for (name, bytes) in &metadata {
         fs::write(destination.join(name), bytes)?;
     }
@@ -323,7 +359,7 @@ fn add_activated_regions(
 }
 
 /// Rebuilds the `CAI_REGION_HLCI` entries of every region whose areas the chain changed (activated, carved, split
-/// and clipped regions): the start position needs exactly one per `regions.esf` area.
+/// and clipped regions): one HLCI per component, containing every area of that component.
 fn rebuild_hlcis(
     path: &Path,
     world_dir: &Path,
@@ -343,8 +379,7 @@ fn rebuild_hlcis(
     progress(&format!("Rebuilding the region HLCIs of {} region(s)", keys.len()));
     let mut file = esf::read(&fs::read(path).with_context(|| format!("Read {}", path.display()))?)?;
     let report = startpos_split::rebuild_region_hlcis(&mut file.root, &rd, &keys)?;
-    // every other region whose HLCI count still differs from its area count (the converted vanilla start position has
-    // some): the engine rejects any mismatch, so they are repaired as well
+    // Repair stale component/area coverage elsewhere without rewriting valid stock multi-area groups.
     let rest = startpos_split::rebuild_region_hlcis(&mut file.root, &rd, &[])?;
     fs::write(path, esf::write(&file)?).with_context(|| format!("Write {}", path.display()))?;
     let mut notes = vec![format!(
@@ -356,7 +391,7 @@ fn rebuild_hlcis(
     )];
     if !rest.regions.is_empty() {
         notes.push(format!(
-            "Region HLCIs repaired in {} further region(s) whose count differed from their area count (the validated in-game start position tolerated those deficits; the added HLCIs are not game-tested): {}",
+            "Region HLCI component/area coverage repaired in {} further region(s): {}",
             rest.regions.len(),
             rest.regions.iter().map(|r| r.key.as_str()).collect::<Vec<_>>().join(", ")
         ));
@@ -365,7 +400,7 @@ fn rebuild_hlcis(
 }
 
 /// Cross-file consistency of the finished map files and start position (the validation pass of the chain, run for
-/// every build): pathfinding lists, sea grid lists, routes, HLCI counts per region, CAI sea cells. Any problem
+/// every build): pathfinding lists, sea grid lists, routes, HLCI component groups and fleet cells. Any problem
 /// aborts the build.
 fn check_world(
     world_dir: &Path,
@@ -375,22 +410,37 @@ fn check_world(
     touched: &BTreeSet<String>,
 ) -> Result<()> {
     let mut problems = stages::validate_world(world_dir, project, stage, touched)?;
-    let regions = esf::read(&fs::read(world_dir.join("regions.esf")).context("Read the generated regions.esf")?)?;
-    let rd = RegionData::parse(&regions.root)?;
-    let pf = esf::read(&fs::read(world_dir.join("pathfinding.esf")).context("Read the generated pathfinding.esf")?)?;
-    let mut lists: Vec<Vec<i16>> = Vec::new();
-    for area in 0..Grid::area_count(&pf.root)? {
-        lists.push(Grid::parse_area(&pf.root, area)?.region_ids);
-    }
-    let cells: usize = stages::sea_cell_counts(world_dir)?.iter().map(|(_, n)| n).sum();
-    let checks = startpos_split::MapChecks::new(&rd, &regions.root, &lists, Some(cells))?;
     let start = esf::read(&fs::read(startpos_path).context("Read the generated startpos.esf")?)?;
-    problems.extend(startpos_split::check_world(&start.root, &checks)?);
+    problems.extend(navigation_problems(world_dir, &start.root)?);
     if problems.is_empty() {
         return Ok(());
     }
     let listing = problems.iter().take(40).cloned().collect::<Vec<_>>().join("\n  ");
     bail!("The generated campaign is inconsistent ({} problems):\n  {listing}", problems.len())
+}
+
+/// Cross-file navigation checks shared by the normal export and the finished atlas.
+fn navigation_problems(world_dir: &Path, start: &esf::Node) -> Result<Vec<String>> {
+    let sea = crate::regionmap::sea_grids::SeaGrids::parse(
+        &esf::read(&fs::read(world_dir.join("sea_grids.esf")).context("Read the generated sea_grids.esf")?)?.root,
+    )?;
+    let regions = esf::read(&fs::read(world_dir.join("regions.esf")).context("Read the generated regions.esf")?)?;
+    let rd = RegionData::parse(&regions.root)?;
+    let pf = esf::read(&fs::read(world_dir.join("pathfinding.esf")).context("Read the generated pathfinding.esf")?)?;
+    let mut lists = Vec::new();
+    for area in 0..Grid::area_count(&pf.root)? {
+        lists.push(Grid::parse_area(&pf.root, area)?.region_ids);
+    }
+    let checks = startpos_split::MapChecks::new(&rd, &regions.root, &lists, Some(sea.cell_count()))?;
+    let mut out = startpos_split::check_world(start, &checks)?;
+    let interface = start.path(&["CAMPAIGN_ENV", "CAMPAIGN_MODEL", "CAI_INTERFACE"])?;
+    out.extend(sea.graph_problems().into_iter().map(|p| format!("sea_grids.esf: {p}")));
+    out.extend(
+        crate::startpos::cai::fleet_cell_problems(interface, &sea)?
+            .into_iter()
+            .map(|p| format!("startpos.esf: {p}")),
+    );
+    Ok(out)
 }
 
 /// Add every applied split to the generated start position, in project order. Each addition is re-read from its
@@ -458,6 +508,9 @@ fn export_metadata(prepared: &Prepared, project: &Project) -> Result<BTreeMap<St
         "dependencies": prepared.dependencies,
         "analysis": prepared.analysis,
         "pack_file": prepared.pack_name,
+        "atlas": project.atlas,
+        "building_scale": project.building_scale,
+        "settlement_moves": project.settlement_moves,
         "manual_installation_only": true,
         "gameplay_tested": false,
     });
@@ -465,11 +518,11 @@ fn export_metadata(prepared: &Prepared, project: &Project) -> Result<BTreeMap<St
         "KGC WORLD CAMPAIGN — MANUAL INSTALLATION\n\
          Target: {}\nLanguage: {}\nPack: {}\n\n\
          1. For TSV targets, use the mod setup that supplied the imported tables. compatibility.json records the TSV inputs, not an audit of installed mod packs. Models, textures and other mod assets are not bundled.\n\
-         2. The generated pack contains the imported target tables and converted campaign data. The world campaign uses only factions that already exist in your target database; no new faction is added. Ensure the pack overrides the corresponding database members in your mod setup. TSV import cannot discover or configure game load order.\n\
-         3. Back up any earlier world-campaign export. Do not combine exports built from different target datasets.\n\
-         4. Drag only the ZIP's data folder into the Napoleon folder containing Napoleon.exe. Do not put it inside the existing data folder.\n\
+         2. The generated pack contains only added/overridden campaign tables, explicitly resolved DB replacements and merged localisation. Unchanged imported mod tables are not copied or repaired; your installed mod supplies them. No new faction is added. Ensure the pack overrides the corresponding campaign members in your mod setup. TSV import cannot discover or configure game load order.\n\
+         3. Close Napoleon. Back up any earlier world-campaign export OUTSIDE the game's data folder. Move the previous generated campaign_maps/nap_world and campaigns/wld_napoleon directories out before copying: merging directories leaves obsolete geometry from the old layout. Do not combine different layouts or target datasets.\n\
+         4. Move any previous zz_campaign_buildings_half_size.pack and zz_campaign_buildings_scale.pack out of data. Then drag only the ZIP's data folder into the Napoleon folder containing Napoleon.exe (not inside data). The optional new building-scale movie pack auto-loads; no mod-list entry is needed. With building scale 1.0 no replacement shader pack is included, so removing the old one restores original size.\n\
          5. Keep kgc-export outside the game; it records this project's inputs and compatibility decisions.\n\
-         6. Start a NEW campaign and test the exact mod setup. Static validation is not gameplay verification.\n\n\
+         6. Restart and start a NEW campaign. Map layout and settlement edits do not migrate existing saves. The building shader pack affects all campaigns on this installation, but never changes save contents. Remove only that pack and restart to revert building size. Test the exact mod setup; static validation is not gameplay verification.\n\n\
          The editor never installs, changes pack activation, or overwrites game files. Any replacement during manual installation is performed by your file manager.\n",
         prepared.analysis.target_name, prepared.analysis.language, prepared.pack_name,
     );

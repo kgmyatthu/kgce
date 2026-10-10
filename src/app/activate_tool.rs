@@ -10,7 +10,7 @@ use crate::{
     regionmap::{chain, regions::RegionData},
     tsv_ui::workflow,
 };
-use eframe::egui::{self, Color32, FontId, Pos2, Rect, Stroke, Vec2};
+use eframe::egui::{self, Color32, FontId, Rect, Stroke, Vec2};
 
 /// Which areas of the picked region become passable.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -165,6 +165,7 @@ impl Editor {
                 self.leave_activate_tool();
             } else {
                 self.leave_split_tool();
+                self.leave_settlement_tool();
                 self.tool = MapTool::Activate;
                 self.activation = ActivationDraft::default();
                 self.mesh_dirty = true;
@@ -350,12 +351,7 @@ impl Editor {
     pub(super) fn draw_wild_labels(&self, painter: &egui::Painter, rect: Rect) {
         let scale = self.scale(rect);
         let font = FontId::proportional(11.0);
-        let to = |point: [f32; 2]| {
-            Pos2::new(
-                rect.center().x + (point[0] - self.center.x) * scale,
-                rect.center().y - (point[1] - self.center.y) * scale,
-            )
-        };
+        let to = |point: [f32; 2]| self.to_screen(point, rect);
         for polygon in self.polygons.iter().filter(|polygon| polygon.wild) {
             if (polygon.bounds[2] - polygon.bounds[0]) * scale < 36.0 {
                 continue;
@@ -386,19 +382,13 @@ impl Editor {
     pub(super) fn draw_activate_overlay(&self, painter: &egui::Painter, rect: Rect, ui: &egui::Ui) {
         let Some(rules) = &self.rules else { return };
         let draft = &self.activation;
-        let scale = self.scale(rect);
-        let to = |point: [f32; 2]| {
-            Pos2::new(
-                rect.center().x + (point[0] - self.center.x) * scale,
-                rect.center().y - (point[1] - self.center.y) * scale,
-            )
-        };
+        let to = |point: [f32; 2]| self.to_screen(point, rect);
         let outline = |data: &RegionData, ri: usize, area: usize, stroke: Stroke| {
             for outline in &data.regions[ri].areas[area].outlines {
-                painter.add(egui::Shape::closed_line(
-                    outline.ring.iter().map(|&id| to(data.vertices[id as usize])).collect(),
-                    stroke,
-                ));
+                let points: Vec<_> = outline.ring.iter().map(|&id| to(data.vertices[id as usize])).collect();
+                if points.iter().all(|p| p.is_finite()) {
+                    painter.add(egui::Shape::closed_line(points, stroke));
+                }
             }
         };
         let faint = Stroke::new(1.2, Color32::from_rgba_unmultiplied(230, 230, 230, 110));

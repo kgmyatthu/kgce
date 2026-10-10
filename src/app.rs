@@ -1,4 +1,6 @@
 mod activate_tool;
+mod atlas_panel;
+mod settlement_tool;
 mod overlay;
 mod split_tool;
 
@@ -16,6 +18,7 @@ use crate::{
 use activate_tool::ActivationDraft;
 use overlay::Overlay;
 use split_tool::{MapTool, SplitDraft};
+use settlement_tool::SettlementDraft;
 use anyhow::{Context, Result};
 use eframe::egui::{self, Color32, Pos2, Rect, Vec2};
 use std::{
@@ -69,6 +72,10 @@ fn rows_of(rules: &Rules, project: &Project) -> Result<Vec<RegionRow>> {
 }
 
 fn polygon_of(polygon: &RegionPolygon, wild: bool) -> Polygon {
+    polygon_with_triangles(polygon.key.clone(), polygon.triangles.clone(), wild)
+}
+
+fn polygon_with_triangles(key: String, triangles: Vec<[[f32; 2]; 3]>, wild: bool) -> Polygon {
     let mut bounds = [
         f32::INFINITY,
         f32::INFINITY,
@@ -77,7 +84,7 @@ fn polygon_of(polygon: &RegionPolygon, wild: bool) -> Polygon {
     ];
     // the centroid of the largest triangle lies inside the polygon
     let (mut largest, mut label_at) = (0.0f32, [0.0f32; 2]);
-    for triangle in &polygon.triangles {
+    for triangle in &triangles {
         for point in triangle {
             bounds[0] = bounds[0].min(point[0]);
             bounds[1] = bounds[1].min(point[1]);
@@ -92,8 +99,8 @@ fn polygon_of(polygon: &RegionPolygon, wild: bool) -> Polygon {
         }
     }
     Polygon {
-        key: polygon.key.clone(),
-        triangles: polygon.triangles.clone(),
+        key,
+        triangles,
         bounds,
         wild,
         label_at,
@@ -142,6 +149,8 @@ pub struct Editor {
     tx: Sender<Event>,
     rx: Receiver<Event>,
     polygons: Vec<Polygon>,
+    /// Clipped/transformed render cache; editing geometry remains in source coordinates.
+    atlas_polygons: Vec<Polygon>,
     bounds: [f32; 4],
     center: Vec2,
     zoom: f32,
@@ -165,6 +174,7 @@ pub struct Editor {
     geometry: Option<Geometry>,
     tool: MapTool,
     draft: SplitDraft,
+    settlement_draft: SettlementDraft,
     /// region borders and settlement markers of `geometry`
     overlay: Overlay,
     show_overlay: bool,
@@ -250,6 +260,7 @@ impl Editor {
             tx,
             rx,
             polygons: Vec::new(),
+            atlas_polygons: Vec::new(),
             bounds: [-820.0, -290.0, 980.0, 580.0],
             center: Vec2::new(80.0, 145.0),
             zoom: 1.0,
@@ -267,6 +278,7 @@ impl Editor {
             geometry: None,
             tool: MapTool::Select,
             draft: SplitDraft::default(),
+            settlement_draft: SettlementDraft::default(),
             overlay: Overlay::default(),
             show_overlay: true,
             confirm_remove_split: None,
@@ -401,6 +413,7 @@ impl Editor {
                 Ok(()) => {
                     self.leave_split_tool();
                     self.leave_activate_tool();
+                    self.leave_settlement_tool();
                     self.confirm_remove_split = None;
                     self.confirm_remove_activation = None;
                     self.dirty = false;
@@ -865,6 +878,7 @@ impl Editor {
             .as_ref()
             .map(|geometry| Overlay::build(&geometry.data, rules))
             .unwrap_or_default();
+        self.rebuild_atlas_preview();
         self.mesh_dirty = true;
     }
 
@@ -872,6 +886,7 @@ impl Editor {
     /// splits on the original geometry and rebuilds the region list and polygons. Everything fallible runs first, so an
     /// error leaves the editor exactly as it was.
     fn install_project(&mut self, project: Project) -> Result<()> {
+        project.validate_structure()?;
         let Some(assets) = &self.derived_assets else {
             self.project = project;
             return Ok(());
@@ -941,7 +956,8 @@ impl Editor {
                 f32::NEG_INFINITY,
                 f32::NEG_INFINITY,
             ];
-            for polygon in &self.polygons {
+            let polygons = if self.project.atlas.is_some() { &self.atlas_polygons } else { &self.polygons };
+            for polygon in polygons {
                 if !polygon.triangles.is_empty() {
                     for i in 0..2 {
                         self.bounds[i] = self.bounds[i].min(polygon.bounds[i]);
@@ -952,10 +968,13 @@ impl Editor {
         }
         for theatre in &self.theatres {
             if self.bounds[0].is_finite() {
-                self.bounds[0] = self.bounds[0].min(theatre.lo[0]);
-                self.bounds[1] = self.bounds[1].min(theatre.lo[1]);
-                self.bounds[2] = self.bounds[2].max(theatre.hi[0]);
-                self.bounds[3] = self.bounds[3].max(theatre.hi[1]);
+                let bounds = self.project.atlas.as_ref().and_then(|plan| {
+                    plan.chart(&theatre.key).and_then(|chart| plan.camera_rect(chart, &theatre.key)).ok()
+                }).unwrap_or([theatre.lo, theatre.hi]);
+                self.bounds[0] = self.bounds[0].min(bounds[0][0]);
+                self.bounds[1] = self.bounds[1].min(bounds[0][1]);
+                self.bounds[2] = self.bounds[2].max(bounds[1][0]);
+                self.bounds[3] = self.bounds[3].max(bounds[1][1]);
             }
         }
         self.center = Vec2::new(
@@ -973,11 +992,7 @@ impl Editor {
     }
 
     fn to_world(&self, point: Pos2, rect: Rect) -> [f32; 2] {
-        let scale = self.scale(rect);
-        [
-            (point.x - rect.center().x) / scale + self.center.x,
-            self.center.y - (point.y - rect.center().y) / scale,
-        ]
+        self.display_to_source(self.to_display_world(point, rect))
     }
 
     /// Pixels (points) per tile of the wilderness hatch texture.
@@ -1009,14 +1024,14 @@ impl Editor {
     }
 
     fn redraw_mesh(&mut self, rect: Rect) {
-        let count = self.polygons.iter().map(|p| p.triangles.len() * 3).sum();
+        let count = self.rendered_polygons().iter().map(|p| p.triangles.len() * 3).sum();
         let mut mesh = egui::Mesh::default();
         mesh.vertices.reserve(count);
         mesh.indices.reserve(count);
         let mut hatch = self.hatch.as_ref().map(|texture| egui::Mesh::with_texture(texture.id()));
         let scale = self.scale(rect);
         // Pending state is read from the stored analysis per polygon; nothing is cloned for the render pass.
-        for polygon in &self.polygons {
+        for polygon in self.rendered_polygons() {
             let picked = self.activation.key.as_deref() == Some(polygon.key.as_str());
             let color = if polygon.wild {
                 if picked {
@@ -1083,6 +1098,7 @@ impl Editor {
             ui.label(match self.tool {
                 MapTool::Split => "Split tool · Click a region, then its border to start a cut · Esc leaves · Scroll to zoom · Right-drag to pan",
                 MapTool::Activate => "Activate tool · Click a hatched wilderness polygon · Esc leaves · Scroll to zoom · Right-drag to pan",
+                MapTool::Settlement => "Settlement tool · Drag a capital or town inside its region · Esc cancels / leaves · Scroll to zoom · Right-drag to pan",
                 MapTool::Select => "Click to select · Ctrl-click multi-select · Scroll to zoom · Right-drag to pan",
             });
             if ui.button("Fit map").clicked() {
@@ -1120,28 +1136,32 @@ impl Editor {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll.abs() > 0.01 {
                 let point = response.hover_pos().unwrap_or(rect.center());
-                let before = self.to_world(point, rect);
+                let before = self.to_display_world(point, rect);
                 self.zoom = (self.zoom * (scroll * 0.002).exp()).clamp(0.6, 16.0);
-                let after = self.to_world(point, rect);
+                let after = self.to_display_world(point, rect);
                 self.center.x += before[0] - after[0];
                 self.center.y += before[1] - after[1];
                 self.mesh_dirty = true;
             }
         }
+        self.settlement_input(ui, &response, rect);
         if response.clicked_by(egui::PointerButton::Primary) {
             if let Some(point) = response.interact_pointer_pos() {
                 let world = self.to_world(point, rect);
-                match self.tool {
-                    MapTool::Split => self.split_click(world, rect),
-                    MapTool::Activate => self.activate_click(world),
-                    MapTool::Select => {
-                        if let Some(key) = self.region_at(world) {
-                            self.select(key, ui.input(|i| i.modifiers.ctrl));
-                        } else if let Some(key) = self.wild_at(world) {
-                            self.push_message(format!(
-                                "{} is wilderness without campaign data; use 'Activate wilderness region' to make it playable.",
-                                splits::default_name(&key)
-                            ));
+                if world.iter().all(|v| v.is_finite()) {
+                    match self.tool {
+                        MapTool::Split => self.split_click(world, rect),
+                        MapTool::Activate => self.activate_click(world),
+                        MapTool::Settlement => self.settlement_click(point, rect),
+                        MapTool::Select => {
+                            if let Some(key) = self.region_at(world) {
+                                self.select(key, ui.input(|i| i.modifiers.ctrl));
+                            } else if let Some(key) = self.wild_at(world) {
+                                self.push_message(format!(
+                                    "{} is wilderness without campaign data; use 'Activate wilderness region' to make it playable.",
+                                    splits::default_name(&key)
+                                ));
+                            }
                         }
                     }
                 }
@@ -1160,13 +1180,17 @@ impl Editor {
         if let Some(mesh) = &self.wild_mesh {
             painter.add(egui::Shape::Mesh(mesh.clone()));
         }
-        if self.show_overlay {
+        self.draw_atlas_frames(&painter, rect);
+        if self.show_overlay || self.settlement_tool_active() {
             self.draw_overlay(&painter, rect);
         }
         if self.tool == MapTool::Split {
             self.draw_split_overlay(&painter, rect, response.hover_pos(), ui);
         }
         self.draw_wild_labels(&painter, rect);
+        if self.tool == MapTool::Settlement {
+            self.draw_settlement_overlay(&painter, rect, ui);
+        }
         if self.tool == MapTool::Activate {
             self.draw_activate_overlay(&painter, rect, ui);
         }
@@ -1218,6 +1242,9 @@ impl Editor {
         ui.checkbox(&mut self.show_overlay, "Show borders & towns");
         self.split_toggle(ui);
         self.activate_toggle(ui);
+        self.settlement_toggle(ui);
+        self.atlas_controls(ui);
+        if self.project.atlas.is_none() {
         ui.label("Theatre bounds are fixed").on_hover_ui(|ui| {
             for (key, rect) in crate::regionmap::theatres::FIXED_BOUNDS {
                 let name = match *key {
@@ -1229,6 +1256,7 @@ impl Editor {
                 ui.label(format!("{name}: {rect:?}"));
             }
         });
+        }
         let list_height = if self.tool != MapTool::Select {
             (ui.available_height() * 0.3).max(120.0)
         } else {
@@ -1298,11 +1326,13 @@ impl Editor {
         ui.separator();
         egui::ScrollArea::vertical()
             .id_salt("sidebar-lower")
+            .min_scrolled_height(180.0)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 match self.tool {
                     MapTool::Split => self.split_panel(ui),
                     MapTool::Activate => self.activate_panel(ui),
+                    MapTool::Settlement => self.settlement_panel(ui),
                     MapTool::Select => self.assign_panel(ui),
                 }
                 self.activations_list(ui);
@@ -1402,6 +1432,7 @@ impl eframe::App for Editor {
         if self.source_ready {
             self.split_keys(ctx);
             self.activate_keys(ctx);
+            self.settlement_keys(ctx);
         }
         self.pump_analysis();
         if let Some(request) = self.ui.pending(&self.project, self.busy, self.source_ready) {
@@ -1620,7 +1651,13 @@ impl eframe::App for Editor {
                 .default_width(300.0)
                 .min_width(265.0)
                 .resizable(true)
-                .show(ctx, |ui| self.sidebar(ui));
+                .show(ctx, |ui| {
+                    let height = ui.available_height();
+                    egui::ScrollArea::vertical().id_salt("map-sidebar").show(ui, |ui| {
+                        ui.set_max_height(height);
+                        self.sidebar(ui);
+                    });
+                });
         }
         egui::CentralPanel::default().show(ctx, |ui| {
             let mut panel = PanelCtx {

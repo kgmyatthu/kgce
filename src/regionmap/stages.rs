@@ -116,7 +116,7 @@ pub fn geometry_stage(map_dir: &Path, project: &Project, progress: &Progress<'_>
     // Fixed theatre bounds, applied to every build (also to projects without activations). Align once through the
     // same geometry operation the editor preview uses; every dependent asset works from these effective bounds,
     // including the climate/wind canvases. A theatre already sitting at its fixed bounds is skipped entirely.
-    let changes = chain::extend(&mut rd)?;
+    let changes = chain::extend_for_project(&mut rd, project)?;
     let mut sea_points = BTreeMap::new();
     if !changes.is_empty() {
         let mut pf_file = read_esf(&pf_path)?;
@@ -339,8 +339,10 @@ pub fn sea_stage(
         for theatre in touched {
             progress(&format!("Theatre {theatre}: sea grid lists and connections"));
             let changed = sea.regenerate_lists(theatre, &rd, &splines, &stage.vanilla_ports)?;
-            let added = sea.complete_conns(theatre)?;
-            notes.push(format!("Sea grid {theatre}: {changed} cell list(s) regenerated, {added} connection(s) added"));
+            let (added, removed) = sea.complete_conns(theatre)?;
+            notes.push(format!(
+                "Sea grid {theatre}: {changed} cell list(s) regenerated, {added} connection(s) added, {removed} removed"
+            ));
         }
         sea.store(&mut sea_file.root)?;
         write_esf(&map_dir.join("sea_grids.esf"), &sea_file)?;

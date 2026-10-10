@@ -1,4 +1,6 @@
 pub mod app;
+pub mod atlas;
+pub mod building_scale;
 pub mod campaign_profile;
 pub mod compatibility;
 pub mod content;
@@ -12,6 +14,7 @@ pub mod pack;
 pub mod pipeline;
 pub mod regionmap;
 mod safety;
+pub mod settlement;
 pub mod snapshot;
 pub mod startpos;
 pub mod target;

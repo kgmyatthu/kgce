@@ -47,12 +47,16 @@ pub fn build_with_notes(
     } else {
         None
     };
+    let sea_path = output_data.join("campaign_maps/nap_world/sea_grids.esf");
+    let sea_grids = crate::esf::read(&fs::read(&sea_path).with_context(|| format!("Read {}", sea_path.display()))?)
+        .with_context(|| format!("Parse {}", sea_path.display()))?;
     let generated = self::core::generate(
         snapshot,
         rules,
         map,
         added_keys,
         edited_regions.as_ref().map(|e| &e.root),
+        &sea_grids.root,
         progress,
     )?;
     let dir = output_data.join("campaigns").join(self::core::CAMPAIGN_KEY);

@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Result, anyhow};
 
 use crate::esf::{Node, Value};
+use crate::regionmap::sea_grids::SeaGrids;
 use crate::startpos::context::BuildContext;
 
 use super::nodes::*;
@@ -538,4 +539,329 @@ pub fn verify(ctx: &BuildContext, ntw: &Node, ci: &Node) -> Result<CheckReport> 
         format!("CAI_GOVERNORSHIP#0 is not a world governorship: {gov0_bad}"),
     );
     Ok(rep)
+}
+
+/// Every fleet of the start position stands in the sea grid cell its position falls into under the grid of the
+/// finished map, and the cell and the fleet agree on it: the fleet's `CAI_MOBILE` names that cell (spec child 15) and
+/// the cell lists the fleet. The stock start positions satisfy this for every fleet. Returns one line per violation.
+pub fn fleet_cell_problems(ci: &Node, sea: &SeaGrids) -> Result<Vec<String>> {
+    let world = get(ci, &["CAI_WORLD"])?;
+    let cells = get_items(world, &["CAI_WORLD_SEA_GRID_CELLS"])?;
+    let mut problems = Vec::new();
+    if cells.len() != sea.cell_count() {
+        problems.push(format!(
+            "the start position holds {} CAI sea grid cells, sea_grids.esf {}",
+            cells.len(),
+            sea.cell_count()
+        ));
+        return Ok(problems);
+    }
+    let mut cell_of_id: HashMap<u32, usize> = HashMap::new();
+    let mut listed: Vec<Vec<u32>> = Vec::with_capacity(cells.len());
+    for (gi, it) in cells.iter().enumerate() {
+        cell_of_id.insert(item_id(it)?, gi);
+        let list = spec_kids(it)?
+            .iter()
+            .find(|c| matches!(c, Node::Array { .. }))
+            .ok_or_else(|| anyhow!("CAI sea grid cell {gi} has no mobile array"))?;
+        let mut ids = Vec::new();
+        for m in arr_items(list)? {
+            ids.push(sc_at(m, 0)?);
+        }
+        ids.sort_unstable();
+        listed.push(ids);
+    }
+    let mut expected: Vec<Vec<u32>> = vec![Vec::new(); cells.len()];
+    for it in get_items(world, &["CAI_WORLD_RESOURCE_MOBILES"])? {
+        let sit = kids(rec_by_name(it, "CAI_SITUATED")?)?;
+        if sc_at(sit, 4)? != 6 {
+            continue;
+        }
+        let id = item_id(it)?;
+        let (x, y) = (f64::from(sc_at(sit, 0)? as i32) / 1_048_576.0, f64::from(sc_at(sit, 1)? as i32) / 1_048_576.0);
+        let want = sea.cell_index_at(x, y);
+        let raw = arr_at(spec_kids(it)?, 15)?;
+        let matches = match want {
+            Some(w) => raw.len() == 1 && cell_of_id.get(&raw[0]) == Some(&w),
+            None => raw.is_empty(),
+        };
+        if !matches {
+            let named: Vec<usize> = raw.iter().filter_map(|c| cell_of_id.get(c).copied()).collect();
+            problems.push(format!(
+                "fleet {id} at ({x:.1}, {y:.1}) belongs to sea grid cell {want:?} but names cell(s) {named:?}"
+            ));
+        }
+        if let Some(w) = want {
+            expected[w].push(id);
+        }
+    }
+    for (gi, want) in expected.iter_mut().enumerate() {
+        want.sort_unstable();
+        if *want != listed[gi] {
+            problems.push(format!("sea grid cell {gi} lists fleets {:?} but {:?} stand in it", listed[gi], want));
+        }
+    }
+    Ok(problems)
+}
+
+#[cfg(test)]
+mod fleet_cell_tests {
+    use super::*;
+    use crate::regionmap::sea_grids::{Area, Cell, TheatreGrid};
+
+    fn grid(name: &str, min: [f32; 2], max: [f32; 2], factor: f32, nx: u32, ny: u32) -> TheatreGrid {
+        let mut cells = Vec::new();
+        let mut areas = Vec::new();
+        for yi in 0..ny {
+            for xi in 0..nx {
+                let lo = [min[0] + xi as f32 * factor, min[1] + yi as f32 * factor];
+                cells.push(Cell { xi, yi, lo, hi: [lo[0] + factor, lo[1] + factor] });
+                areas.push(Area { id: areas.len() as u32, lands: vec![], seas: vec![], ports: vec![], numbers: vec![] });
+            }
+        }
+        TheatreGrid { name: name.into(), min, max, factor, xsize: nx, ysize: ny, cells, areas, connections: vec![] }
+    }
+
+    fn rec(name: &str, children: Vec<Node>) -> Node {
+        Node::Record { name: name.into(), version: 0, children }
+    }
+
+    fn arr(name: &str, items: Vec<Vec<Node>>) -> Node {
+        Node::Array { name: name.into(), version: 0, items }
+    }
+
+    /// CAI id of the cell item `gi`
+    fn cell_id(gi: usize) -> u32 {
+        7000 + gi as u32
+    }
+
+    fn fixed(v: f64) -> i32 {
+        (v * 1_048_576.0) as i32
+    }
+
+    /// interface with `cells` cells (lists as given) and one mobile per `(id, kind, x, y, named cell)`
+    fn interface(lists: &[&[u32]], mobiles: &[(u32, u32, f64, f64, Option<usize>)]) -> Node {
+        let cells = lists
+            .iter()
+            .enumerate()
+            .map(|(gi, l)| {
+                vec![
+                    u32n(cell_id(gi)),
+                    rec(
+                        "CAI_SEA_GRID_CELL",
+                        vec![u32n(gi as u32), arr("CAI_SEA_GRID_CELL_MOBILES", l.iter().map(|m| vec![u32n(*m)]).collect())],
+                    ),
+                ]
+            })
+            .collect();
+        let mobs = mobiles
+            .iter()
+            .map(|&(id, kind, x, y, named)| {
+                let mut spec = vec![u32n(0); 16];
+                spec[15] = arrn(&named.map(|c| vec![cell_id(c)]).unwrap_or_default());
+                vec![
+                    u32n(id),
+                    rec("CAI_SITUATED", vec![i32n(fixed(x)), i32n(fixed(y)), u32n(1), arrn(&[1]), u32n(kind)]),
+                    rec("CAI_MOBILE", spec),
+                ]
+            })
+            .collect();
+        rec(
+            "CAI_INTERFACE",
+            vec![rec(
+                "CAI_WORLD",
+                vec![arr("CAI_WORLD_SEA_GRID_CELLS", cells), arr("CAI_WORLD_RESOURCE_MOBILES", mobs)],
+            )],
+        )
+    }
+
+    /// two theatres (4 + 4 cells): `3` is the vanilla India grid, `2` lies elsewhere
+    fn two_theatres(india_min: [f32; 2], india_max: [f32; 2], factor: f32) -> SeaGrids {
+        SeaGrids { grids: vec![grid("2", [-180.0, 140.0], [440.0, 520.0], 310.0, 2, 2), grid("3", india_min, india_max, factor, 2, 2)] }
+    }
+
+    #[test]
+    fn cell_rule_follows_the_grid_that_was_moved() {
+        let vanilla = two_theatres([440.0, 20.0], [680.0, 280.0], 75.0);
+        let moved = two_theatres([440.0, -80.0], [790.0, 300.0], 95.0);
+        // a fleet of the stock India start position
+        assert_eq!(vanilla.cell_index_at(565.3, 50.7), Some(4 + 1));
+        assert_eq!(moved.cell_index_at(565.3, 50.7), Some(4 + 3));
+        // outside every theatre rectangle
+        assert_eq!(moved.cell_index_at(900.0, 50.0), None);
+        assert_eq!(moved.cell_count(), 8);
+    }
+
+    #[test]
+    fn fleet_filed_by_the_stock_grid_is_reported_on_the_moved_grid() {
+        let moved = two_theatres([440.0, -80.0], [790.0, 300.0], 95.0);
+        // position (565.3, 50.7) is in cell 7 of the moved grid; the start position built against the stock grid
+        // files it in cell 5
+        let stale = interface(&[&[], &[], &[], &[], &[], &[9], &[], &[], ], &[(9, 6, 565.3, 50.7, Some(5))]);
+        let problems = fleet_cell_problems(&stale, &moved).unwrap();
+        assert_eq!(problems.len(), 3, "{problems:?}");
+    }
+
+    #[test]
+    fn consistent_fleets_pass_and_land_forces_are_ignored() {
+        let moved = two_theatres([440.0, -80.0], [790.0, 300.0], 95.0);
+        let ok = interface(
+            &[&[], &[], &[], &[], &[], &[], &[], &[9, 11]],
+            &[
+                (9, 6, 565.3, 50.7, Some(7)),
+                (11, 6, 600.0, 60.0, Some(7)),
+                // an army somewhere in the same cell is not a fleet
+                (12, 4, 600.0, 60.0, None),
+                // a fleet outside every grid is in no cell
+                (13, 6, 900.0, 50.0, None),
+            ],
+        );
+        assert_eq!(fleet_cell_problems(&ok, &moved).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn cell_count_mismatch_is_reported() {
+        let moved = two_theatres([440.0, -80.0], [790.0, 300.0], 95.0);
+        let few = interface(&[&[], &[]], &[]);
+        assert_eq!(fleet_cell_problems(&few, &moved).unwrap().len(), 1);
+    }
+
+    /// The stock start position satisfies the rule against the stock sea grid (the rule the generator now builds to).
+    #[test]
+    fn stock_start_position_follows_the_rule() {
+        const WORK: &str = "F:/NTW2/work";
+        let (start, sea) = (
+            format!("{WORK}/exp4/backup/data/campaigns/wld_napoleon/startpos.esf"),
+            format!("{WORK}/exp1/backup/campaign_maps/nap_world/sea_grids.esf"),
+        );
+        if !std::path::Path::new(&start).exists() || !std::path::Path::new(&sea).exists() {
+            eprintln!("skipped: stock start position not available");
+            return;
+        }
+        let start = crate::esf::read(&std::fs::read(start).unwrap()).unwrap();
+        let sea = crate::esf::read(&std::fs::read(sea).unwrap()).unwrap();
+        let sea = SeaGrids::parse(&sea.root).unwrap();
+        let ci = start.root.path(&["CAMPAIGN_ENV", "CAMPAIGN_MODEL", "CAI_INTERFACE"]).unwrap();
+        assert_eq!(fleet_cell_problems(ci, &sea).unwrap(), Vec::<String>::new());
+    }
+
+    /// America (extended west, negative x), Europe and the extended India grid, in file order: 42 + 54 + 16 cells.
+    /// `scale`/`shift` map the whole layout the way an atlas chart moves a theatre.
+    fn three_theatres(scale: f64, shift: [f64; 2]) -> SeaGrids {
+        let place = |p: [f32; 2]| [(p[0] as f64 * scale + shift[0]) as f32, (p[1] as f64 * scale + shift[1]) as f32];
+        let theatre = |name: &str, min: [f32; 2], max: [f32; 2], factor: f32, nx: u32, ny: u32| {
+            grid(name, place(min), place(max), (factor as f64 * scale) as f32, nx, ny)
+        };
+        SeaGrids {
+            grids: vec![
+                theatre("1", [-888.0, 0.0], [-340.0, 460.0], 92.0, 6, 7),
+                theatre("2", [-180.0, 140.0], [440.0, 520.0], 75.0, 9, 6),
+                theatre("3", [440.0, -80.0], [790.0, 300.0], 95.0, 4, 4),
+            ],
+        }
+    }
+
+    /// start position over `lists` (per cell, the fleets it names) and `fleets` (id, x, y, filed cell)
+    fn filed(lists: &[Vec<u32>], fleets: &[(u32, f64, f64, Option<usize>)]) -> Node {
+        let refs: Vec<&[u32]> = lists.iter().map(Vec::as_slice).collect();
+        let mobiles: Vec<(u32, u32, f64, f64, Option<usize>)> = fleets.iter().map(|&(id, x, y, c)| (id, 6, x, y, c)).collect();
+        interface(&refs, &mobiles)
+    }
+
+    /// Fleets at hand-computed positions across three theatres with negative coordinates, cell borders (exactly on
+    /// them and just below) and the offset of each theatre in the global cell numbering.
+    #[test]
+    fn fleets_are_filed_by_theatre_offset_and_cell_borders() {
+        let sea = three_theatres(1.0, [0.0, 0.0]);
+        assert_eq!(sea.cell_count(), 112);
+        // (id, x, y, expected global cell)
+        let at: [(u32, f64, f64, Option<usize>); 13] = [
+            (1, -888.0, 0.0, Some(0)),
+            (2, -796.0, 0.0, Some(1)),
+            (3, -796.001, 0.0, Some(0)),
+            (4, -400.5, 459.9, Some(4 * 6 + 5)),
+            (5, -341.0, 100.0, Some(6 + 5)),
+            // x == the rectangle's upper edge: in no theatre
+            (6, -340.0, 100.0, None),
+            (7, -180.0, 140.0, Some(42)),
+            (8, 0.0, 300.0, Some(42 + 2 * 9 + 2)),
+            (9, 439.9, 519.9, Some(42 + 5 * 9 + 8)),
+            (10, 565.3, 50.7, Some(96 + 4 + 1)),
+            (11, 535.0, 15.0, Some(96 + 4 + 1)),
+            (12, 534.999, 14.999, Some(96)),
+            (13, 789.9, 299.9, Some(96 + 15)),
+        ];
+        let mut lists = vec![Vec::new(); 112];
+        for &(id, x, y, cell) in &at {
+            assert_eq!(sea.cell_index_at(x, y), cell, "fleet {id}");
+            if let Some(c) = cell {
+                lists[c].push(id);
+            }
+        }
+        assert_eq!(fleet_cell_problems(&filed(&lists, &at), &sea).unwrap(), Vec::<String>::new());
+        // one fleet filed in a neighbouring cell: its own reference, the cell that wrongly lists it and the cell that
+        // lacks it are the three findings
+        for (k, &(_, _, _, cell)) in at.iter().enumerate() {
+            let Some(c) = cell else { continue };
+            let wrong = if c + 1 < 112 { c + 1 } else { c - 1 };
+            let mut fleets = at;
+            fleets[k].3 = Some(wrong);
+            let mut bad = lists.clone();
+            bad[c].retain(|&id| id != at[k].0);
+            bad[wrong].push(at[k].0);
+            assert_eq!(fleet_cell_problems(&filed(&bad, &fleets), &sea).unwrap().len(), 3, "fleet {}", at[k].0);
+            // the fleet names its cell but the cell does not list it: one finding
+            let mut omitted = lists.clone();
+            omitted[c].retain(|&id| id != at[k].0);
+            assert_eq!(fleet_cell_problems(&filed(&omitted, &at), &sea).unwrap().len(), 1, "fleet {}", at[k].0);
+        }
+    }
+
+    /// Fleets at the centre of every cell whose centre lies inside its theatre rectangle, in the stock layout and in
+    /// an atlas-scaled, shifted layout: each is filed in its own cell. Positions of one layout filed against the
+    /// other layout's grid are reported.
+    #[test]
+    fn every_cell_is_reachable_in_stock_and_atlas_scaled_layouts() {
+        let centres = |sea: &SeaGrids| {
+            let mut out = Vec::new();
+            let mut offset = 0;
+            for g in &sea.grids {
+                for (i, c) in g.cells.iter().enumerate() {
+                    let centre = [(c.lo[0] as f64 + c.hi[0] as f64) / 2.0, (c.lo[1] as f64 + c.hi[1] as f64) / 2.0];
+                    if centre[0] < g.max[0] as f64 && centre[1] < g.max[1] as f64 {
+                        out.push((centre[0], centre[1], offset + i));
+                    }
+                }
+                offset += g.cells.len();
+            }
+            out
+        };
+        let stock = three_theatres(1.0, [0.0, 0.0]);
+        let atlas = three_theatres(1.3516979217529297, [-20.5, 33.25]);
+        for (name, sea) in [("stock", &stock), ("atlas", &atlas)] {
+            let cells = centres(sea);
+            // 30 America + 40 Europe + 16 India cells have their centre inside the rectangle
+            assert_eq!(cells.len(), 86, "{name}");
+            let fleets: Vec<(u32, f64, f64, Option<usize>)> =
+                cells.iter().enumerate().map(|(n, &(x, y, c))| (1000 + n as u32, x, y, Some(c))).collect();
+            let mut lists = vec![Vec::new(); 112];
+            for &(id, _, _, c) in &fleets {
+                lists[c.unwrap()].push(id);
+            }
+            assert_eq!(fleet_cell_problems(&filed(&lists, &fleets), sea).unwrap(), Vec::<String>::new(), "{name}");
+        }
+        // the atlas positions filed by the stock grid land in other cells or none
+        let fleets: Vec<(u32, f64, f64, Option<usize>)> = centres(&atlas)
+            .iter()
+            .enumerate()
+            .map(|(n, &(x, y, _))| (1000 + n as u32, x, y, stock.cell_index_at(x, y)))
+            .collect();
+        let mut lists = vec![Vec::new(); 112];
+        for &(id, _, _, c) in &fleets {
+            if let Some(c) = c {
+                lists[c].push(id);
+            }
+        }
+        assert!(!fleet_cell_problems(&filed(&lists, &fleets), &atlas).unwrap().is_empty());
+    }
 }

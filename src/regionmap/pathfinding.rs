@@ -13,7 +13,7 @@
 //!   line is (header, u32 a) of one following cell sharing the run's path id.
 //! * piece = (u32 a, u32 b): a = passable << 24 | flags << 4 | type; b = path id << 22 | grid << 21 | polyline index.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use anyhow::{Result, anyhow, bail, ensure};
 
@@ -488,17 +488,29 @@ pub struct ExtendReport {
     /// old type-2 pieces inside a moved transition area that became sea pieces
     pub transition_pieces_to_sea: usize,
     pub words_changed: usize,
+    /// old whole outside cells of the impassable frame along a moved edge that became sea runs
+    pub frame_cells_to_sea: usize,
+    /// old outside pieces of that frame (cells shared with a coast or the frame boundary) that became sea pieces
+    pub frame_pieces_to_sea: usize,
 }
 
 const OUTSIDE_HEADER: [u8; 8] = [0x1f, 0xff, 0x1f, 0xff, 0xff, 0x1f, 0xff, 0x1f];
 /// piece / run word of a whole passable sea cell before the neighbour rules are applied
 const SEA_RUN_WORD: u32 = 0xff11_0111;
 const OUTSIDE_RUN_WORD: u32 = 0x0000_0002;
+/// Old impassable-frame material of a grid, see [`Grid::outward_frame`]: a whole outside cell, or the indices of the
+/// outside pieces of a mixed cell that lie wholly inside the frame.
+#[derive(Clone, Debug)]
+enum Frame {
+    Run,
+    Pieces(Vec<usize>),
+}
 
 /// Outline of regions.esf with the bounding box used to find the innermost polygon covering a point.
 struct Locator {
     rings: Vec<(usize, usize, bool, Vec<P>, [f64; 4], f64)>,
     sea: Vec<bool>,
+    passable: Vec<Vec<bool>>,
 }
 
 impl Locator {
@@ -526,11 +538,15 @@ impl Locator {
                 }
             }
         }
-        Self { rings, sea: rd.regions.iter().map(|r| r.kind == "sea").collect() }
+        Self {
+            rings,
+            sea: rd.regions.iter().map(|r| r.kind == "sea").collect(),
+            passable: rd.regions.iter().map(|r| r.areas.iter().map(|a| a.passable).collect()).collect(),
+        }
     }
 
-    /// Region covering `pt` (innermost outer ring by bounding-box area, holes of that area excluded).
-    fn locate(&self, pt: P) -> Option<usize> {
+    /// Region and area covering `pt` (innermost outer ring by bounding-box area, holes of that area excluded).
+    fn locate_area(&self, pt: P) -> Option<(usize, usize)> {
         let mut best: Option<(usize, f64, usize)> = None;
         for (ri, ai, outer, pts, bb, barea) in &self.rings {
             if *outer
@@ -550,11 +566,129 @@ impl Locator {
                 return None;
             }
         }
-        Some(ri)
+        Some((ri, ai))
     }
 
     fn is_sea(&self, pt: P) -> bool {
-        self.locate(pt).is_some_and(|ri| self.sea[ri])
+        self.locate_area(pt).is_some_and(|(ri, _)| self.sea[ri])
+    }
+
+    /// `pt` lies in a sea area that is not passable (the shipped impassable frame polygons; the passable sea areas
+    /// beside a coast keep their outside coast bands).
+    fn is_impassable_sea(&self, pt: P) -> bool {
+        self.locate_area(pt).is_some_and(|(ri, ai)| self.sea[ri] && !self.passable[ri][ai])
+    }
+}
+
+impl Grid {
+    /// Whether old cell `i` is cleared-frame material: a whole outside cell wholly inside impassable sea, or a cell
+    /// whose outside pieces lie wholly inside impassable sea. Passable sea, land and coast bands (outside pieces that
+    /// also touch land or passable sea) are never frame. Results are memoised in `memo`.
+    fn frame_of(&self, old: &[Cell], loc: &Locator, memo: &mut BTreeMap<usize, Option<Frame>>, i: usize) -> Result<bool> {
+        if let Some(known) = memo.get(&i) {
+            return Ok(known.is_some());
+        }
+        let cell = &old[i];
+        let (o, s) = (self.cell_origin(i), self.size);
+        let found = if cell.pieces.is_empty() {
+            let (cx, cy, k) = (o[0] + s / 2.0, o[1] + s / 2.0, 0.4 * s);
+            let whole = cell.empty.is_some_and(|(a, _)| a & 15 == 2)
+                && [[0.0, 0.0], [k, k], [k, -k], [-k, k], [-k, -k]].iter().all(|d| loc.is_impassable_sea([cx + d[0], cy + d[1]]));
+            whole.then_some(Frame::Run)
+        } else {
+            let mut hit = Vec::new();
+            for (k, p) in cell.pieces.iter().enumerate().filter(|(_, p)| p.a & 15 == 2) {
+                let poly = self.piece_polygon(i, p)?;
+                let m = centroid(&poly);
+                let inside = std::iter::once(m)
+                    .chain(poly.iter().flat_map(|v| [0.5, 0.9].map(|t| [m[0] + t * (v[0] - m[0]), m[1] + t * (v[1] - m[1])])))
+                    .all(|pt| loc.is_impassable_sea(pt));
+                if inside {
+                    hit.push(k);
+                }
+            }
+            (!hit.is_empty()).then_some(Frame::Pieces(hit))
+        };
+        let is_frame = found.is_some();
+        memo.insert(i, found);
+        Ok(is_frame)
+    }
+
+    /// The impassable frame cells that hug the edges flagged in `moved` (`[west, east, south, north]`) of this grid.
+    /// Detection follows the data: from each frame cell on a moved edge it spreads through contiguous frame cells and
+    /// stops at passable sea, land and coast bands, so any frame width is covered and a frame polygon that does not
+    /// reach a moved edge (an isolated interior impassable area) is never touched. Where such a frame also runs along
+    /// an edge that stays (a corner), a cell is released only if it is strictly nearer to a moved edge than to every
+    /// unmoved edge the frame touches, so the unmoved edge keeps its band.
+    fn outward_frame(&self, old: &[Cell], loc: &Locator, moved: [bool; 4]) -> Result<BTreeMap<usize, Frame>> {
+        let (cols, rows) = (self.cols, self.rows);
+        let mut memo: BTreeMap<usize, Option<Frame>> = BTreeMap::new();
+        let mut seen = BTreeSet::new();
+        let mut seeds = Vec::new();
+        for c in 0..cols {
+            if moved[2] {
+                seeds.push(c);
+            }
+            if moved[3] {
+                seeds.push((rows - 1) * cols + c);
+            }
+        }
+        for r in 0..rows {
+            if moved[0] {
+                seeds.push(r * cols);
+            }
+            if moved[1] {
+                seeds.push(r * cols + cols - 1);
+            }
+        }
+        let (x1, y1) = (self.x0 + cols as f64 * self.size, self.y0 + rows as f64 * self.size);
+        let mut out = BTreeMap::new();
+        for seed in seeds {
+            if seen.contains(&seed) || !self.frame_of(old, loc, &mut memo, seed)? {
+                continue;
+            }
+            // one connected frame
+            let mut component = vec![seed];
+            let mut queue = VecDeque::from([seed]);
+            seen.insert(seed);
+            while let Some(i) = queue.pop_front() {
+                let (c, r) = ((i % cols) as i64, (i / cols) as i64);
+                for (dc, dr) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    let (nc, nr) = (c + dc, r + dr);
+                    if nc < 0 || nr < 0 || nc >= cols as i64 || nr >= rows as i64 {
+                        continue;
+                    }
+                    let n = nr as usize * cols + nc as usize;
+                    if !seen.contains(&n) && self.frame_of(old, loc, &mut memo, n)? {
+                        seen.insert(n);
+                        queue.push_back(n);
+                        component.push(n);
+                    }
+                }
+            }
+            // unmoved edges this frame runs along
+            let mut guarded = [false; 4];
+            for &i in &component {
+                let (c, r) = (i % cols, i / cols);
+                guarded[0] |= c == 0;
+                guarded[1] |= c + 1 == cols;
+                guarded[2] |= r == 0;
+                guarded[3] |= r + 1 == rows;
+            }
+            for &i in &component {
+                let o = self.cell_origin(i);
+                let (cx, cy) = (o[0] + self.size / 2.0, o[1] + self.size / 2.0);
+                let to_edge = [cx - self.x0, x1 - cx, cy - self.y0, y1 - cy];
+                let release = (0..4).filter(|&k| moved[k]).map(|k| to_edge[k]).fold(f64::INFINITY, f64::min);
+                let keep = (0..4).filter(|&k| !moved[k] && guarded[k]).map(|k| to_edge[k]).fold(f64::INFINITY, f64::min);
+                if release < keep {
+                    if let Some(Some(frame)) = memo.remove(&i) {
+                        out.insert(i, frame);
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -563,7 +697,9 @@ impl Grid {
     /// old cells keep their content and move to their new position; new cells become sea runs where a sea polygon of
     /// `rd` covers the cell centre and outside runs elsewhere (header of the nearest old sea cell / the outside header,
     /// 0x01 bytes towards off-grid neighbours); old type-2 pieces inside a moved transition area become sea pieces;
-    /// the a-words near the old border, the new cells and the moved transition areas are recomputed with the rules.
+    /// the outside cells of an impassable sea frame hugging a moved edge (America's west edge) become sea too, so the
+    /// moved exit is not walled in; the a-words near the old border, the new cells, the moved transition areas and
+    /// the cleared frame are recomputed with the rules.
     pub fn extend(&mut self, new_rect: Rect, rd: &RegionData, transitions: &[TransitionArea]) -> Result<ExtendReport> {
         let dim = self.size;
         let (nmin, nmax) = ([new_rect[0][0] as f64, new_rect[0][1] as f64], [new_rect[1][0] as f64, new_rect[1][1] as f64]);
@@ -619,17 +755,54 @@ impl Grid {
         let mut report = ExtendReport { cols: ncols, rows: nrows, offset: [offc, offr], ..Default::default() };
         let mut cells: Vec<Option<Cell>> = vec![None; ncols * nrows];
         let old_cells = std::mem::take(&mut self.cells);
+        // Edges that moved outwards: the impassable frame that hugged the old edge is now interior sea.
+        let moved_sides = [offc > 0, offc + self.cols < ncols, offr > 0, offr + self.rows < nrows];
+        let frame = if moved_sides.contains(&true) { self.outward_frame(&old_cells, &loc, moved_sides)? } else { BTreeMap::new() };
+        let mut frame_cells: Vec<(usize, usize)> = Vec::new();
         for r in 0..nrows {
             for c in 0..ncols {
                 let (cx, cy) = (nmin[0] + (c as f64 + 0.5) * dim, nmin[1] + (r as f64 + 0.5) * dim);
                 let (oc, orow) = (c as i64 - offc as i64, r as i64 - offr as i64);
                 let cell = if oc >= 0 && (oc as usize) < self.cols && orow >= 0 && (orow as usize) < self.rows {
-                    let mut cell = old_cells[orow as usize * self.cols + oc as usize].clone();
+                    let old_index = orow as usize * self.cols + oc as usize;
+                    let mut cell = old_cells[old_index].clone();
                     if cell.pieces.iter().any(|p| p.a & 15 == 2) && moved.iter().any(|t| in_rect(cx, cy, &t.old)) {
                         for p in cell.pieces.iter_mut().filter(|p| p.a & 15 == 2) {
                             *p = Piece { a: (p.a & !0xf) | 1, b: ((sea_pid as u32) << 22) | (p.b & 0x3f_ffff) };
                             report.transition_pieces_to_sea += 1;
                         }
+                    }
+                    match frame.get(&old_index) {
+                        Some(Frame::Run) => {
+                            cell = Cell { header: nearest_sea_hdr(c, r), pieces: Vec::new(), empty: Some((SEA_RUN_WORD, sea_pid)) };
+                            report.frame_cells_to_sea += 1;
+                            frame_cells.push((c, r));
+                        }
+                        Some(Frame::Pieces(hit)) => {
+                            let mut cleared = false;
+                            for &i in hit {
+                                let p = cell.pieces[i].clone();
+                                if p.a & 15 == 2 {
+                                    cell.pieces[i] = Piece { a: (p.a & !0xf) | 1, b: ((sea_pid as u32) << 22) | (p.b & 0x3f_ffff) };
+                                    report.frame_pieces_to_sea += 1;
+                                    cleared = true;
+                                }
+                            }
+                            if cleared {
+                                // 0xff on a diagonal byte means that corner lies in an outside piece; no longer true there
+                                let replacement = nearest_sea_hdr(c, r);
+                                for (byte, corner) in [(1usize, 1u32), (3, 3), (4, 0), (6, 2)] {
+                                    let outside_corner = cell.pieces.iter().any(|p| {
+                                        matches!(p.a & 15, 2 | 3) && self.polylines.get(&p.polyline()).is_some_and(|ids| ids.contains(&corner))
+                                    });
+                                    if !outside_corner && cell.header[byte] == 0xff {
+                                        cell.header[byte] = replacement[byte];
+                                    }
+                                }
+                                frame_cells.push((c, r));
+                            }
+                        }
+                        None => {}
                     }
                     cell
                 } else if loc.is_sea([cx, cy]) {
@@ -669,12 +842,27 @@ impl Grid {
         // a-words near the old border / the new cells / the moved transition areas
         let model = Model::from_grid(self)?;
         let view = View::build(&model);
+        let dirty = {
+            // a-words read the neighbouring cells two steps away, so a cleared frame cell dirties its surroundings
+            let mut dirty = vec![false; ncols * nrows];
+            for &(c, r) in &frame_cells {
+                for rr in r.saturating_sub(2)..(r + 3).min(nrows) {
+                    for cc in c.saturating_sub(2)..(c + 3).min(ncols) {
+                        dirty[rr * ncols + cc] = true;
+                    }
+                }
+            }
+            dirty
+        };
         let near_change = |c: usize, r: usize| -> bool {
             let (oc, orow) = (c as i64 - offc as i64, r as i64 - offr as i64);
             if oc < 0 || orow < 0 || oc >= old_cols as i64 || orow >= old_rows as i64 {
                 return true;
             }
             if oc <= 1 || orow <= 1 || oc >= old_cols as i64 - 2 || orow >= old_rows as i64 - 2 {
+                return true;
+            }
+            if dirty[r * ncols + c] {
                 return true;
             }
             let (cx, cy) = (nmin[0] + (c as f64 + 0.5) * dim, nmin[1] + (r as f64 + 0.5) * dim);

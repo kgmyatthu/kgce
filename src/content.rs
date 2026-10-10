@@ -1553,7 +1553,9 @@ struct MergedLoc {
     replaced: usize,
 }
 
-/// Full file = vanilla entries (new text replacing an existing key in place) + new keys sorted by key.
+/// Full file = target entries (new text replacing an existing key in place) + new keys sorted by key. Entries of keys
+/// the conversion does not write stay exactly as they are, including keys the target repeats; a written key must
+/// end up defined once.
 fn merge_loc(base: &[u8], new: &BTreeMap<String, LocRow>) -> Result<MergedLoc> {
     let (version, mut merged) = db::decode_loc(base).context("Decode vanilla LOC")?;
     let mut index: HashMap<String, usize> = HashMap::with_capacity(merged.len());
@@ -1574,8 +1576,10 @@ fn merge_loc(base: &[u8], new: &BTreeMap<String, LocRow>) -> Result<MergedLoc> {
         }
     }
     let mut keys = HashSet::with_capacity(merged.len());
+    let mut written = HashSet::with_capacity(new.len());
     for (k, _, _) in &merged {
-        if !keys.insert(k.clone()) {
+        keys.insert(k.clone());
+        if new.contains_key(k) && !written.insert(k.clone()) {
             bail!("merged LOC would contain duplicate key {k}");
         }
     }
@@ -2085,11 +2089,12 @@ mod tests {
     }
 
     #[test]
-    fn merge_replaces_in_place_and_appends_sorted() {
+    fn merge_updates_written_keys_and_preserves_unrelated_duplicates() {
         let base = db::encode_loc(
             &[
                 ("a".into(), "old".into(), 0),
                 ("z".into(), "keep".into(), 1),
+                ("z".into(), "also keep".into(), 0),
             ],
             1,
         )
@@ -2123,14 +2128,18 @@ mod tests {
         assert_eq!((merged.added, merged.replaced), (2, 1));
         let (_, entries) = db::decode_loc(&merged.bytes).unwrap();
         let keys: Vec<&str> = entries.iter().map(|e| e.0.as_str()).collect();
-        assert_eq!(keys, ["a", "z", "b", "m"]);
+        assert_eq!(keys, ["a", "z", "z", "b", "m"]);
         assert_eq!(entries[0], ("a".into(), "new".into(), 1));
+        assert_eq!(
+            entries[1..3],
+            [("z".into(), "keep".into(), 1), ("z".into(), "also keep".into(), 0)]
+        );
         let dup = db::encode_loc(
             &[("a".into(), "1".into(), 0), ("a".into(), "2".into(), 0)],
             1,
         )
         .unwrap();
-        assert!(merge_loc(&dup, &BTreeMap::new()).is_err());
+        assert!(merge_loc(&dup, &new).is_err());
     }
 
     #[test]

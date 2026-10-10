@@ -186,6 +186,30 @@ impl SeaGrids {
         self.grids.iter().find(|g| g.name == theatre)
     }
 
+    /// Total number of cells of all theatre grids (the length of the start position's `CAI_WORLD_SEA_GRID_CELLS`).
+    pub fn cell_count(&self) -> usize {
+        self.grids.iter().map(|g| g.cells.len()).sum()
+    }
+
+    /// Index, among all cells of all theatres in file order, of the cell the campaign AI files a fleet at `(x, y)` in:
+    /// the first theatre whose rectangle `[min, max)` holds the point, then the cell column/row `floor((p - min) /
+    /// factor)` clamped to the grid. This is the rule that holds for every fleet of the stock start positions (the
+    /// cell lists of `CAI_WORLD_SEA_GRID_CELLS` and the cell id of each fleet's `CAI_MOBILE`), so the start position has
+    /// to be built against the grid of the *finished* map: [`SeaGrids::resize_theatre`] moves the cell boxes.
+    pub fn cell_index_at(&self, x: f64, y: f64) -> Option<usize> {
+        let mut offset = 0;
+        for g in &self.grids {
+            let (x0, y0, x1, y1) = (g.min[0] as f64, g.min[1] as f64, g.max[0] as f64, g.max[1] as f64);
+            if x0 <= x && x < x1 && y0 <= y && y < y1 && g.xsize > 0 && g.ysize > 0 {
+                let col = (((x - x0) / g.factor as f64) as usize).min(g.xsize as usize - 1);
+                let row = (((y - y0) / g.factor as f64) as usize).min(g.ysize as usize - 1);
+                return Some(offset + row * g.xsize as usize + col);
+            }
+            offset += g.cells.len();
+        }
+        None
+    }
+
     fn grid_index(&self, theatre: &str) -> Result<usize> {
         self.grids.iter().position(|g| g.name == theatre).with_context(|| format!("sea_grids has no theatre {theatre}"))
     }
@@ -286,10 +310,12 @@ impl SeaGrids {
         Ok(changed)
     }
 
-    /// Complete the connection graph of `theatre` over its sea-bearing cells: existing values are kept, every missing
-    /// pair `(id_a < id_b)` is added (8-adjacent cells 0.0, others the distance between the cell centres) and the list
-    /// is sorted. Returns the number of connections added.
-    pub fn complete_conns(&mut self, theatre: &str) -> Result<usize> {
+    /// Make the connection graph of `theatre` the clique of its sea-bearing cells, which is the shape of every stock
+    /// theatre (one `(id_a < id_b)` pair per two sea cells, none for a cell without sea): existing values of pairs
+    /// between sea cells are kept, every missing pair is added (8-adjacent cells 0.0, others the distance between the
+    /// cell centres), connections that name a cell without any sea are removed (a cell that lost its sea when the
+    /// grid moved keeps no stale edges) and the list is sorted. Returns `(added, removed)`.
+    pub fn complete_conns(&mut self, theatre: &str) -> Result<(usize, usize)> {
         let gi = self.grid_index(theatre)?;
         let g = &mut self.grids[gi];
         let centres: BTreeMap<u32, [f64; 2]> = g
@@ -298,7 +324,10 @@ impl SeaGrids {
             .zip(&g.areas)
             .map(|(c, a)| (a.id, [(c.lo[0] as f64 + c.hi[0] as f64) / 2.0, (c.lo[1] as f64 + c.hi[1] as f64) / 2.0]))
             .collect();
-        let sea: Vec<u32> = g.areas.iter().filter(|a| !a.seas.is_empty()).map(|a| a.id).collect();
+        let sea: BTreeSet<u32> = g.areas.iter().filter(|a| !a.seas.is_empty()).map(|a| a.id).collect();
+        let before = g.connections.len();
+        g.connections.retain(|&(a, b, _)| sea.contains(&a) && sea.contains(&b));
+        let removed = before - g.connections.len();
         let have: BTreeSet<(u32, u32)> = g.connections.iter().map(|&(a, b, _)| (a, b)).collect();
         let factor = g.factor as f64;
         let mut added = 0;
@@ -314,7 +343,34 @@ impl SeaGrids {
             }
         }
         g.connections.sort_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)).then(x.2.total_cmp(&y.2)));
-        Ok(added)
+        Ok((added, removed))
+    }
+
+    /// Check that every pair of sea-bearing cells has exactly one ordered connection, with no edges into non-sea cells.
+    pub fn graph_problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for g in &self.grids {
+            let sea: BTreeSet<u32> = g.areas.iter().filter(|a| !a.seas.is_empty()).map(|a| a.id).collect();
+            let mut seen: BTreeSet<(u32, u32)> = BTreeSet::new();
+            for &(a, b, _) in &g.connections {
+                if !seen.insert((a, b)) {
+                    out.push(format!("theatre {}: connection {a}-{b} is listed twice", g.name));
+                }
+                if a >= b {
+                    out.push(format!("theatre {}: connection {a}-{b} is not ordered", g.name));
+                }
+                for id in [a, b] {
+                    if !sea.contains(&id) {
+                        out.push(format!("theatre {}: connection {a}-{b} names cell {id} which has no sea", g.name));
+                    }
+                }
+            }
+            let missing = sea.iter().flat_map(|&a| sea.iter().filter(move |&&b| a < b).map(move |&b| (a, b))).filter(|p| !seen.contains(p)).count();
+            if missing > 0 {
+                out.push(format!("theatre {}: {missing} pair(s) of sea cells are not connected", g.name));
+            }
+        }
+        out
     }
 }
 
@@ -609,5 +665,223 @@ mod tests {
         assert_eq!(g.cells[0].lo, [440.0, -80.0]);
         assert_eq!(g.cells[15].hi, [820.0, 300.0]);
         assert!(sg.resize_theatre("nope", [[0.0, 0.0], [1.0, 1.0]]).is_err());
+    }
+
+    fn synthetic(sea: [bool; 4], conns: Vec<(u32, u32, f32)>) -> SeaGrids {
+        let mut cells = Vec::new();
+        let mut areas = Vec::new();
+        for i in 0..4u32 {
+            let (xi, yi) = (i % 2, i / 2);
+            let lo = [100.0 * xi as f32, 100.0 * yi as f32];
+            cells.push(Cell { xi, yi, lo, hi: [lo[0] + 100.0, lo[1] + 100.0] });
+            let seas = if sea[i as usize] { vec!["sea".to_string()] } else { vec![] };
+            areas.push(Area { id: 10 + i, lands: vec![], seas, ports: vec![], numbers: vec![] });
+        }
+        SeaGrids {
+            grids: vec![TheatreGrid {
+                name: "t".into(),
+                min: [0.0, 0.0],
+                max: [200.0, 200.0],
+                factor: 100.0,
+                xsize: 2,
+                ysize: 2,
+                cells,
+                areas,
+                connections: conns,
+            }],
+        }
+    }
+
+    #[test]
+    fn complete_conns_makes_the_graph_the_clique_of_the_sea_cells() {
+        // cell 11 lost its sea when the grid moved but kept its edges; cell 13 gained sea and has none
+        let mut sg = synthetic([true, false, true, true], vec![(10, 11, -1.0), (10, 12, 7.0), (11, 12, -1.0)]);
+        assert_eq!(sg.graph_problems().len(), 3, "{:?}", sg.graph_problems());
+        assert_eq!(sg.complete_conns("t").unwrap(), (2, 2));
+        assert_eq!(sg.graph_problems(), Vec::<String>::new());
+        // kept value, centre distance of the diagonal-adjacent pair is 0.0 (8-adjacent), all sorted
+        assert_eq!(sg.grids[0].connections, vec![(10, 12, 7.0), (10, 13, 0.0), (12, 13, 0.0)]);
+        // idempotent
+        assert_eq!(sg.complete_conns("t").unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn graph_problems_names_a_sea_cell_without_connections() {
+        let sg = synthetic([true, true, true, false], vec![(10, 11, 0.0)]);
+        let problems = sg.graph_problems();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+    }
+
+    #[test]
+    fn stock_sea_graphs_have_no_problems() {
+        let Some(van) = read(&format!("{WORK}/exp1/backup/campaign_maps/nap_world/sea_grids.esf")) else { return };
+        assert_eq!(SeaGrids::parse(&van.root).unwrap().graph_problems(), Vec::<String>::new());
+    }
+
+    /// The stock India grid of this editor's output: theatre "3", 4x4 cells of 95 from (440, -80) with ids 96..=111 of
+    /// which `sea` carry sea; `edges` are the stock connections.
+    fn india(sea: std::ops::RangeInclusive<u32>, edges: Vec<(u32, u32, f32)>) -> SeaGrids {
+        let (mut cells, mut areas) = (Vec::new(), Vec::new());
+        for id in 96..112u32 {
+            let (xi, yi) = ((id - 96) % 4, (id - 96) / 4);
+            let lo = [440.0 + 95.0 * xi as f32, -80.0 + 95.0 * yi as f32];
+            cells.push(Cell { xi, yi, lo, hi: [lo[0] + 95.0, lo[1] + 95.0] });
+            let seas = if sea.contains(&id) { vec!["bay_of_bengal".to_string()] } else { vec![] };
+            areas.push(Area { id, lands: vec![], seas, ports: vec![], numbers: vec![] });
+        }
+        SeaGrids {
+            grids: vec![TheatreGrid {
+                name: "3".into(),
+                min: [440.0, -80.0],
+                max: [790.0, 300.0],
+                factor: 95.0,
+                xsize: 4,
+                ysize: 4,
+                cells,
+                areas,
+                connections: edges,
+            }],
+        }
+    }
+
+    /// Stock India had sea in cells 96..=104 (9 cells, 36 pairs); the extended bounds add sea to 105, 106 and 107
+    /// (12 cells, 66 pairs). Every new cell must be connected to every other sea cell, the stock edges keep their
+    /// costs, and no cell without sea gets an edge.
+    #[test]
+    fn india_nine_to_twelve_sea_cells_gives_the_full_66_pair_graph() {
+        let mut stock_edges = Vec::new();
+        for a in 96..=104u32 {
+            for b in a + 1..=104 {
+                stock_edges.push((a, b, (a * 1000 + b) as f32));
+            }
+        }
+        assert_eq!(stock_edges.len(), 36);
+        let mut sg = india(96..=104, stock_edges.clone());
+        assert_eq!(sg.graph_problems(), Vec::<String>::new());
+        // the regenerated lists give 105..=107 sea
+        for area in &mut sg.grids[0].areas[9..12] {
+            area.seas = vec!["bay_of_bengal".to_string()];
+        }
+        assert!(!sg.graph_problems().is_empty());
+        assert_eq!(sg.complete_conns("3").unwrap(), (30, 0));
+        assert_eq!(sg.graph_problems(), Vec::<String>::new());
+        let conns = &sg.grids[0].connections;
+        assert_eq!(conns.len(), 66);
+        assert!(conns.windows(2).all(|w| (w[0].0, w[0].1) < (w[1].0, w[1].1)));
+        for new in [105u32, 106, 107] {
+            let mut others: Vec<u32> = conns
+                .iter()
+                .filter_map(|&(a, b, _)| if a == new { Some(b) } else if b == new { Some(a) } else { None })
+                .collect();
+            others.sort_unstable();
+            let want: Vec<u32> = (96..=107).filter(|&id| id != new).collect();
+            assert_eq!(others, want, "cell {new}");
+        }
+        for &(a, b, cost) in &stock_edges {
+            assert_eq!(conns.iter().find(|c| (c.0, c.1) == (a, b)).map(|c| c.2), Some(cost), "stock edge {a}-{b}");
+        }
+        // new pairs: 0.0 between 8-adjacent cells, else the distance between the cell centres
+        let centre = |id: u32| {
+            let (xi, yi) = ((id - 96) % 4, (id - 96) / 4);
+            [440.0 + 95.0 * (xi as f64 + 0.5), -80.0 + 95.0 * (yi as f64 + 0.5)]
+        };
+        for &(a, b, cost) in conns.iter().filter(|c| !stock_edges.iter().any(|s| (s.0, s.1) == (c.0, c.1))) {
+            let (ca, cb) = (centre(a), centre(b));
+            let (dx, dy) = ((ca[0] - cb[0]).abs(), (ca[1] - cb[1]).abs());
+            let want = if dx <= 95.0 && dy <= 95.0 { 0.0 } else { dx.hypot(dy) };
+            assert_eq!(cost, want as f32, "new edge {a}-{b}");
+        }
+        let cost_of = |a: u32, b: u32| conns.iter().find(|c| (c.0, c.1) == (a, b)).unwrap().2;
+        assert_eq!(cost_of(104, 105), 0.0);
+        assert_eq!(cost_of(105, 106), 0.0);
+        assert_eq!(cost_of(96, 105), 95.0f64.hypot(190.0) as f32);
+        assert_eq!(cost_of(96, 107), 285.0f64.hypot(190.0) as f32);
+        // cells 108..=111 have no sea and no edge
+        assert!(conns.iter().all(|c| c.0 < 108 && c.1 < 108));
+        // a second pass changes nothing
+        let again = sg.clone();
+        assert_eq!(sg.complete_conns("3").unwrap(), (0, 0));
+        assert_eq!(sg, again);
+    }
+
+    /// 75-unit stock-like grid of `nx` x `ny` cells from `min`, cell ids from 0.
+    fn stock_like(min: [f32; 2], nx: u32, ny: u32) -> SeaGrids {
+        let (mut cells, mut areas) = (Vec::new(), Vec::new());
+        for i in 0..nx * ny {
+            let (xi, yi) = (i % nx, i / nx);
+            let lo = [min[0] + 75.0 * xi as f32, min[1] + 75.0 * yi as f32];
+            cells.push(Cell { xi, yi, lo, hi: [lo[0] + 75.0, lo[1] + 75.0] });
+            areas.push(Area { id: i, lands: vec![], seas: vec![], ports: vec![], numbers: vec![] });
+        }
+        let max = [min[0] + 75.0 * nx as f32, min[1] + 75.0 * ny as f32];
+        SeaGrids { grids: vec![TheatreGrid { name: "t".into(), min, max, factor: 75.0, xsize: nx, ysize: ny, cells, areas, connections: vec![] }] }
+    }
+
+    /// After a theatre is moved by `resize_theatre` (new origin, new cell size, negative coordinates, atlas-scaled
+    /// rectangles) the fleet lookup must still agree with the cell rectangles the same file stores.
+    #[test]
+    fn fleet_cell_lookup_agrees_with_the_cell_boxes_after_resizing() {
+        let cases: [(&str, [f32; 2], u32, u32, Rect); 3] = [
+            ("India extended", [440.0, 20.0], 4, 4, [[440.0, -80.0], [790.0, 300.0]]),
+            ("America extended west, negative x", [-760.0, 0.0], 6, 7, [[-888.0, 0.0], [-340.0, 460.0]]),
+            (
+                "atlas-scaled India",
+                [440.0, 20.0],
+                4,
+                4,
+                [[169.020263671875, -223.677001953125], [642.114501953125, 289.96826171875]],
+            ),
+        ];
+        for (name, min, nx, ny, rect) in cases {
+            let mut sg = stock_like(min, nx, ny);
+            sg.grids[0].name = "t".into();
+            sg.resize_theatre("t", rect).unwrap();
+            let g = &sg.grids[0];
+            for (i, cell) in g.cells.iter().enumerate() {
+                let centre = [(cell.lo[0] as f64 + cell.hi[0] as f64) / 2.0, (cell.lo[1] as f64 + cell.hi[1] as f64) / 2.0];
+                if centre[0] < rect[1][0] as f64 && centre[1] < rect[1][1] as f64 {
+                    assert_eq!(sg.cell_index_at(centre[0], centre[1]), Some(i), "{name}: centre of cell {i}");
+                }
+            }
+            // a lattice of points strictly inside the rectangle lands in the cell whose stored box holds it
+            for iy in 0..23 {
+                for ix in 0..23 {
+                    let p = [
+                        rect[0][0] as f64 + (rect[1][0] - rect[0][0]) as f64 * (ix as f64 + 0.37) / 23.0,
+                        rect[0][1] as f64 + (rect[1][1] - rect[0][1]) as f64 * (iy as f64 + 0.37) / 23.0,
+                    ];
+                    let i = sg.cell_index_at(p[0], p[1]).unwrap_or_else(|| panic!("{name}: {p:?} is in no cell"));
+                    let c = &g.cells[i];
+                    assert!(
+                        c.lo[0] as f64 <= p[0] && p[0] < c.hi[0] as f64 && c.lo[1] as f64 <= p[1] && p[1] < c.hi[1] as f64,
+                        "{name}: {p:?} filed in cell {i} {:?}-{:?}",
+                        c.lo,
+                        c.hi
+                    );
+                }
+            }
+        }
+    }
+
+    /// Cell borders of integer grids that cross zero: the lower border belongs to the higher cell, just below it to
+    /// the lower one, also for negative coordinates; the theatre rectangle's upper edges are outside.
+    #[test]
+    fn fleet_cell_lookup_borders_with_negative_origin() {
+        // rectangle [-160, 290) x [-75, 450), 6 columns of 75
+        let sg = stock_like([-160.0, -75.0], 6, 7);
+        assert_eq!(sg.cell_index_at(-160.0, -75.0), Some(0));
+        assert_eq!(sg.cell_index_at(-85.0, -75.0), Some(1));
+        assert_eq!(sg.cell_index_at(-85.001, -75.0), Some(0));
+        assert_eq!(sg.cell_index_at(-160.0, 0.0), Some(6));
+        assert_eq!(sg.cell_index_at(-160.0, -0.001), Some(0));
+        // either side of zero in the same cell, one cell row up
+        assert_eq!(sg.cell_index_at(-0.5, 10.0), Some(8));
+        assert_eq!(sg.cell_index_at(0.0, 0.0), Some(8));
+        assert_eq!(sg.cell_index_at(289.999, 449.999), Some(6 * 7 - 1));
+        // outside the rectangle
+        assert_eq!(sg.cell_index_at(290.0, 0.0), None);
+        assert_eq!(sg.cell_index_at(-160.1, 0.0), None);
+        assert_eq!(sg.cell_index_at(-100.0, 450.0), None);
+        assert_eq!(sg.cell_index_at(-100.0, -75.1), None);
     }
 }

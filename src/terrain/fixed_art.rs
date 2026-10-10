@@ -1,4 +1,4 @@
-//! Source-bound fixed-theatre artwork of the two repaired theatres (America `"1"`, India `"3"`).
+//! Source-bound artwork for repaired source theatres: India `"3"`, plus extended America `"1"` in the unscaled layout.
 //!
 //! Replacement artwork is not shipped: repaired supertexture tiles and raw heightmap runs are generated natively
 //! ([`super::art`]) from the user's own ETW snapshot (`world_.stpi`/`world_.stpd`, `heightmaps/default.tga`) and a
@@ -11,8 +11,10 @@
 //!   heights.bin     u32 LE run count, then [u32 offset][u32 len][len bytes] runs over the bottom-first raw pixel
 //!                   stream (sorted, disjoint, maximal runs of pixels that differ from the original heightmap)
 //! ```
+//! The atlas keeps America's original source bounds/artwork and uses `<art_cache>/original-america/fixed_art/`
+//! with an India-only manifest. Selection is bound into the cache key; the two layouts never reuse each other's repairs.
 //!
-//! The manifest `binding` is SHA-256 over the recipe version, [`FIXED_BOUNDS`], the manifest hashes of the three ETW
+//! The manifest `binding` is SHA-256 over the recipe version, the selected [`FIXED_BOUNDS`], the manifest hashes of the three ETW
 //! source files and the fingerprint of the shipped public terrain data. A cache whose binding, layout or file hashes
 //! do not match is rejected and regenerated from the snapshot (never used as a stale fallback); every tile is also
 //! bound to the SHA-256 of its baseline uncompressed DXT5 tile and the height runs to the SHA-256 of the whole
@@ -67,7 +69,7 @@ const SRC_HEIGHTMAP: &str = "heightmaps/default.tga";
 
 // ------------------------------------------------------------------ public API
 
-/// Validated fixed-theatre artwork of both repaired theatres, loaded from (or freshly generated into) the cache.
+/// Validated artwork for the source theatres extended by the selected layout.
 pub struct FixedArt {
     tiles: HashMap<u32, Tile>,
     heights_source: [u8; 32],
@@ -88,12 +90,15 @@ impl FixedArt {
     pub fn load_or_generate(
         snapshot: &Snapshot,
         art_cache: &Path,
+        extend_america: bool,
         progress: &Progress,
     ) -> Result<FixedArt> {
-        let binding = binding(snapshot)?;
+        let binding = binding(snapshot, extend_america)?;
+        let original_america_cache = (!extend_america).then(|| art_cache.join("original-america"));
+        let art_cache = original_america_cache.as_deref().unwrap_or(art_cache);
         let dir = art_cache.join(CACHE_DIR);
         if dir.join("manifest.json").is_file() {
-            match load(&dir, &binding) {
+            match load(&dir, &binding, extend_america) {
                 Ok(art) => {
                     progress("Display: fixed theatre terrain taken from the local art cache");
                     return Ok(art);
@@ -112,16 +117,19 @@ impl FixedArt {
         let india = art::india::generate(&source, &heights, &india_dem, progress)
             .context("generate the fixed India theatre art")?;
         drop(india_dem);
-        let america_dem = Dem::load(Theatre::America)?;
-        let america = art::america::generate(&source, &heights, &america_dem, progress)
-            .context("generate the fixed America theatre art")?;
-        drop(america_dem);
-        let parts = [(AMERICA_THEATRE, america), (INDIA_THEATRE, india)];
+        let mut parts = Vec::with_capacity(if extend_america { 2 } else { 1 });
+        if extend_america {
+            let america_dem = Dem::load(Theatre::America)?;
+            let america = art::america::generate(&source, &heights, &america_dem, progress)
+                .context("generate the fixed America theatre art")?;
+            parts.push((AMERICA_THEATRE, america));
+        }
+        parts.push((INDIA_THEATRE, india));
         let shas = source_hashes(snapshot)?;
         publish(
             art_cache, &binding, &shas, &parts, &source, &heights, progress,
         )?;
-        load(&dir, &binding).context("verify the freshly generated fixed theatre art cache")
+        load(&dir, &binding, extend_america).context("verify the freshly generated fixed theatre art cache")
     }
 
     /// Replacement bytes for supertexture tile `index`, after proving that `original_ntw_tile` is the baseline tile
@@ -242,16 +250,19 @@ fn source_hashes(snapshot: &Snapshot) -> Result<SourceHashes> {
 
 /// SHA-256 over everything the generated art depends on besides the code: recipe version, fixed bounds, the three
 /// ETW source file hashes and the shipped public terrain data.
-fn binding(snapshot: &Snapshot) -> Result<[u8; 32]> {
+fn binding(snapshot: &Snapshot, extend_america: bool) -> Result<[u8; 32]> {
     let shas = source_hashes(snapshot)?;
-    Ok(binding_of(&shas, &dem::recipe_fingerprint()))
+    Ok(binding_of(&shas, &dem::recipe_fingerprint(), extend_america))
 }
 
-fn binding_of(shas: &SourceHashes, terrain_data: &[u8; 32]) -> [u8; 32] {
+fn binding_of(shas: &SourceHashes, terrain_data: &[u8; 32], extend_america: bool) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"kgc-fixed-art-binding\0");
     h.update(RECIPE_VERSION.to_le_bytes());
     for (key, rect) in FIXED_BOUNDS {
+        if !extend_america && *key == AMERICA_THEATRE {
+            continue;
+        }
         h.update(key.as_bytes());
         h.update([0]);
         for coordinate in rect.iter().flatten() {
@@ -275,7 +286,7 @@ fn sha256_field(value: &str, what: &str) -> Result<[u8; 32]> {
 
 // ------------------------------------------------------------------ load
 
-fn load(dir: &Path, binding: &[u8; 32]) -> Result<FixedArt> {
+fn load(dir: &Path, binding: &[u8; 32], extend_america: bool) -> Result<FixedArt> {
     let manifest_path = dir.join("manifest.json");
     let manifest: Manifest = serde_json::from_slice(
         &fs::read(&manifest_path).with_context(|| format!("read {}", manifest_path.display()))?,
@@ -291,14 +302,10 @@ fn load(dir: &Path, binding: &[u8; 32]) -> Result<FixedArt> {
         sha256_field(&manifest.binding, "manifest binding")? == *binding,
         "fixed art cache is bound to a different ETW source or recipe"
     );
+    let expected: &[&str] = if extend_america { &[AMERICA_THEATRE, INDIA_THEATRE] } else { &[INDIA_THEATRE] };
     ensure!(
-        manifest.theatres.len() == 2
-            && manifest
-                .theatres
-                .iter()
-                .map(|t| t.key.as_str())
-                .eq([AMERICA_THEATRE, INDIA_THEATRE]),
-        "fixed art manifest must describe exactly theatres {AMERICA_THEATRE} and {INDIA_THEATRE}"
+        manifest.theatres.iter().map(|t| t.key.as_str()).eq(expected.iter().copied()),
+        "fixed art manifest does not match the selected source theatre extensions {expected:?}"
     );
     for t in &manifest.theatres {
         let (_, bounds) = FIXED_BOUNDS
@@ -682,7 +689,7 @@ fn publish(
     }
     if let Err(e) = fs::rename(&tmp, &dir) {
         // a concurrent run may have published the same cache first
-        if load(&dir, binding).is_ok() {
+        if load(&dir, binding, parts.iter().any(|(key, _)| *key == AMERICA_THEATRE)).is_ok() {
             let _ = fs::remove_dir_all(&tmp);
         } else {
             return Err(e).with_context(|| format!("publish {}", dir.display()));
@@ -898,9 +905,9 @@ mod tests {
             ("1", part(&[10, 11], 1000..1010, &base)),
             ("3", part(&[20], 5000..5003, &base)),
         ];
-        let binding = binding_of(&shas(), &[7u8; 32]);
+        let binding = binding_of(&shas(), &[7u8; 32], true);
         publish(&root, &binding, &shas(), &parts, &FakeTiles, &base, &quiet).unwrap();
-        let art = load(&root.join(CACHE_DIR), &binding).unwrap();
+        let art = load(&root.join(CACHE_DIR), &binding, true).unwrap();
         let original = stpx::encode_ntw_tile(&fake_raw(10)).unwrap();
         let replacement = art.tile(10, &original).unwrap().unwrap();
         assert_eq!(
@@ -919,7 +926,27 @@ mod tests {
         // repairs apply once: the already-repaired buffer is no longer the baseline
         assert!(art.apply_heights(&mut raw).is_err());
         // another binding (different source or recipe) is rejected
-        assert!(load(&root.join(CACHE_DIR), &binding_of(&shas(), &[8u8; 32])).is_err());
+        assert!(load(&root.join(CACHE_DIR), &binding_of(&shas(), &[8u8; 32], true), true).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn original_america_layout_keeps_its_pixels_and_refuses_extended_layout_caches() {
+        let root = scratch("original-america");
+        let base = heights();
+        let binding = binding_of(&shas(), &[7u8; 32], false);
+        let parts = [(INDIA_THEATRE, part(&[20], 5000..5003, &base))];
+        publish(&root, &binding, &shas(), &parts, &FakeTiles, &base, &quiet).unwrap();
+        let dir = root.join(CACHE_DIR);
+        let art = load(&dir, &binding, false).unwrap();
+        let original = stpx::encode_ntw_tile(&fake_raw(10)).unwrap();
+        assert!(art.tile(10, &original).unwrap().is_none());
+        let mut raw = base.clone();
+        assert_eq!(art.apply_heights(&mut raw).unwrap(), 3);
+        assert_eq!(raw[1000], base[1000]);
+        assert_eq!(raw[5002], base[5002].wrapping_add(1));
+        assert!(load(&dir, &binding, true).is_err());
+        assert!(load(&dir, &binding_of(&shas(), &[7u8; 32], true), false).is_err());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -927,7 +954,7 @@ mod tests {
     fn overlapping_tiles_or_heights_are_refused() {
         let root = scratch("overlap");
         let base = heights();
-        let binding = binding_of(&shas(), &[7u8; 32]);
+        let binding = binding_of(&shas(), &[7u8; 32], true);
         let tiles_overlap = [
             ("1", part(&[10], 1000..1010, &base)),
             ("3", part(&[10], 5000..5003, &base)),
@@ -970,26 +997,26 @@ mod tests {
             ("1", part(&[10], 1000..1010, &base)),
             ("3", part(&[20], 5000..5003, &base)),
         ];
-        let binding = binding_of(&shas(), &[7u8; 32]);
+        let binding = binding_of(&shas(), &[7u8; 32], true);
         publish(&root, &binding, &shas(), &parts, &FakeTiles, &base, &quiet).unwrap();
         let dir = root.join(CACHE_DIR);
-        assert!(load(&dir, &binding).is_ok());
+        assert!(load(&dir, &binding, true).is_ok());
         let tile = dir.join("tiles/10.bin");
         let good = fs::read(&tile).unwrap();
         let mut bad = good.clone();
         let n = bad.len();
         bad[n - 5] ^= 0x55;
         fs::write(&tile, &bad).unwrap();
-        assert!(load(&dir, &binding).is_err());
+        assert!(load(&dir, &binding, true).is_err());
         fs::write(&tile, &good).unwrap();
         fs::remove_file(dir.join("tiles/20.bin")).unwrap();
-        assert!(load(&dir, &binding).is_err());
+        assert!(load(&dir, &binding, true).is_err());
         fs::write(
             dir.join("tiles/20.bin"),
             fs::read(dir.join("tiles/10.bin")).unwrap(),
         )
         .unwrap();
-        assert!(load(&dir, &binding).is_err());
+        assert!(load(&dir, &binding, true).is_err());
         let _ = fs::remove_dir_all(&root);
     }
 

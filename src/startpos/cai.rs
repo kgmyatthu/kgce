@@ -17,13 +17,12 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::esf::{self, Node, Value};
-use crate::snapshot::Game;
+use crate::esf::{Node, Value};
 
 use super::context::{BuildContext, ForceKind};
 use nodes::*;
 
-pub use check::CheckReport;
+pub use check::{CheckReport, fleet_cell_problems};
 
 /// Result of the CAI build.
 pub struct CaiOutput {
@@ -89,14 +88,7 @@ pub fn build(ctx: &mut BuildContext) -> Result<CaiOutput> {
 pub fn build_with(ctx: &mut BuildContext, options: CaiOptions) -> Result<CaiOutput> {
     let etw = ctx.etw_model.clone();
     let ntw = ctx.ntw_model.clone();
-    let sea = {
-        let bytes = ctx
-            .snapshot
-            .read(Game::Etw, "campaign_maps/global_map/sea_grids.esf")
-            .context("Read ETW sea_grids.esf")?;
-        esf::read(&bytes).context("Decode ETW sea_grids.esf")?
-    };
-    let mut cb = CaiBuilder::new(&etw, &ntw, &sea.root, ctx, options)?;
+    let mut cb = CaiBuilder::new(&etw, &ntw, ctx.sea_grids, ctx, options)?;
     cb.allocate(ctx)?;
     let linked = cb.link_regions(ctx)?;
     cb.build_entity_items(ctx)?;
@@ -120,6 +112,11 @@ pub fn build_with(ctx: &mut BuildContext, options: CaiOptions) -> Result<CaiOutp
             "generated CAI graph is inconsistent:\n{}",
             report.problems().join("\n")
         );
+    }
+    let sea = crate::regionmap::sea_grids::SeaGrids::parse(ctx.sea_grids).context("Parse the generated sea_grids.esf")?;
+    let fleet_problems = fleet_cell_problems(&interface, &sea)?;
+    if !fleet_problems.is_empty() {
+        bail!("generated CAI sea grid cells disagree with sea_grids.esf:\n{}", fleet_problems.join("\n"));
     }
     Ok(CaiOutput {
         interface,
@@ -266,6 +263,11 @@ impl<'m> CaiBuilder<'m> {
             }
         }
         let seagrid = parse_seagrid(sea_root, &theatre_cai)?;
+        let cells = get_items(cw_e, &["CAI_WORLD_SEA_GRID_CELLS"])?.len();
+        let grid_cells: usize = seagrid.iter().map(|g| g.cols * g.rows).sum();
+        if cells != grid_cells {
+            bail!("the generated sea_grids.esf has {grid_cells} cells but the CAI world holds {cells} sea grid cells");
+        }
 
         // NTW templates
         let mut t_char = BTreeMap::new();
@@ -2088,7 +2090,7 @@ fn retarget_theatres(pool: &mut Node, eur: u32) -> Result<()> {
     Ok(())
 }
 
-/// sea grid parameters per theatre (cols, rows, size, p0, p1) from ETW `sea_grids.esf`
+/// Sea grid parameters per theatre (cols, rows, size, p0, p1) from the generated `sea_grids.esf`.
 fn parse_seagrid(root: &Node, theatre_cai: &BTreeMap<String, u32>) -> Result<Vec<SeaGrid>> {
     let ch = kids(root)?;
     let mut out: Vec<SeaGrid> = Vec::new();
@@ -2129,7 +2131,7 @@ fn parse_seagrid(root: &Node, theatre_cai: &BTreeMap<String, u32>) -> Result<Vec
         off += g.cols * g.rows;
     }
     if out.is_empty() {
-        bail!("ETW sea_grids.esf holds no sea grid for the CAI theatres");
+        bail!("The generated sea_grids.esf holds no sea grid for the CAI theatres");
     }
     Ok(out)
 }

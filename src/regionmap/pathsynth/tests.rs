@@ -212,6 +212,7 @@ fn extend_reproduces_exp3_grid() {
     let east = TransitionArea { id: 11, old: [[660.63, 17.73], [678.66, 118.5]], new: [[770.63, 17.73], [788.66, 118.5]] };
     let west = TransitionArea { id: 10, old: [[436.42, 17.49], [454.61, 105.5]], new: [[436.42, 17.49], [454.61, 105.5]] };
     let report = grid.extend([[440.0, -80.0], [790.0, 300.0]], &rd, &[west, east]).unwrap();
+    assert_eq!((report.frame_cells_to_sea, report.frame_pieces_to_sea), (0, 0), "India has no impassable frame at its moved edges");
     eprintln!("extend report: {report:?}");
     let expect = Grid::parse_area(&ef.root, AREA).unwrap();
     assert_eq!((grid.cols, grid.rows), (expect.cols, expect.rows));
@@ -225,6 +226,336 @@ fn extend_reproduces_exp3_grid() {
     assert!(same_sig as f64 / n as f64 >= 0.999);
     assert!(same_hdr as f64 / n as f64 >= 0.999);
     assert!(same_word as f64 / n as f64 >= 0.999);
+}
+
+fn passable_sea(c: &crate::regionmap::pathfinding::Cell) -> bool {
+    match c.empty {
+        Some((a, _)) if c.pieces.is_empty() => a & 15 == 1 && a >> 24 != 0,
+        _ => c.pieces.iter().any(|p| p.a & 15 == 1 && p.a >> 24 != 0),
+    }
+}
+
+fn has_outside(c: &crate::regionmap::pathfinding::Cell) -> bool {
+    match c.empty {
+        Some((a, _)) if c.pieces.is_empty() => a & 15 == 2,
+        _ => c.pieces.iter().any(|p| p.a & 15 == 2),
+    }
+}
+
+/// Cell kinds and paths of a cell, independent of the a-words that the neighbours influence.
+fn cell_kinds(c: &crate::regionmap::pathfinding::Cell) -> (Vec<(u32, u16)>, Option<(u32, u16)>, [u8; 8]) {
+    (c.pieces.iter().map(|p| (p.a & 15, p.path_id())).collect(), c.empty.map(|(a, id)| (a & 15, id)), c.header)
+}
+
+/// Cells whose centre lies in `rect`.
+fn cells_centred_in(grid: &Grid, rect: crate::regionmap::geometry::Rect) -> Vec<usize> {
+    (0..grid.cells.len())
+        .filter(|&i| {
+            let o = grid.cell_origin(i);
+            let (cx, cy) = (o[0] + grid.size / 2.0, o[1] + grid.size / 2.0);
+            f64::from(rect[0][0]) <= cx && cx <= f64::from(rect[1][0]) && f64::from(rect[0][1]) <= cy && cy <= f64::from(rect[1][1])
+        })
+        .collect()
+}
+
+/// Passable-sea cells (4-neighbourhood) reachable from `from`.
+fn sea_component(grid: &Grid, from: usize) -> std::collections::BTreeSet<usize> {
+    let mut seen = std::collections::BTreeSet::new();
+    if !passable_sea(&grid.cells[from]) {
+        return seen;
+    }
+    let mut queue = std::collections::VecDeque::from([from]);
+    seen.insert(from);
+    while let Some(i) = queue.pop_front() {
+        let (c, r) = ((i % grid.cols) as i64, (i / grid.cols) as i64);
+        for (dc, dr) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let (nc, nr) = (c + dc, r + dr);
+            if nc < 0 || nr < 0 || nc >= grid.cols as i64 || nr >= grid.rows as i64 {
+                continue;
+            }
+            let n = nr as usize * grid.cols + nc as usize;
+            if passable_sea(&grid.cells[n]) && seen.insert(n) {
+                queue.push_back(n);
+            }
+        }
+    }
+    seen
+}
+
+/// America's enlarged west edge: the exit slides to the new edge, but the stock west edge was wrapped in an impassable
+/// frame whose outside cells stayed behind as a wall across the sea, sealing the moved exit off from every ship.
+#[test]
+fn america_west_extension_clears_the_old_frame_and_keeps_the_moved_exit_reachable() {
+    use crate::regionmap::pathfinding::TransitionArea;
+    use crate::regionmap::stages::{new_problems, problem_identities};
+    let (Some((mut pff, _)), Some((mut rf, _))) = (load(&vanilla_pf()), load(&vanilla_regions())) else {
+        eprintln!("skip: vanilla files missing");
+        return;
+    };
+    let mut rd = RegionData::parse(&rf.root).unwrap();
+    let area = rd.theatre_rects().iter().position(|(key, _)| key == "1").unwrap();
+    let stock = Grid::parse_area(&pff.root, area).unwrap();
+    let preserved = rd.transition_areas("1").unwrap();
+    let baseline = problem_identities(&stock, &rd);
+
+    let change = rd.extend_theatre("1", [[-888.0, 0.0], [-340.0, 460.0]]).unwrap();
+    assert_eq!(change.moved.len(), 1, "only the exit on the moved west edge slides");
+    let exit = change.moved[0];
+    assert_eq!((exit.id, exit.old, exit.new), (1, [[-760.0, 80.0], [-740.0, 120.0]], [[-888.0, 80.0], [-868.0, 120.0]]));
+    let moves: Vec<TransitionArea> = change.moved.iter().map(|m| TransitionArea { id: m.id, old: m.old, new: m.new }).collect();
+    let mut grid = stock.clone();
+    let report = grid.extend(change.new_rect, &rd, &moves).unwrap();
+    assert_eq!(report.offset, [64, 0]);
+    let old_to_new = |i: usize| (i / stock.cols + report.offset[1]) * grid.cols + i % stock.cols + report.offset[0];
+
+    // the moved exit lies on traversable sea ...
+    let zone = cells_centred_in(&grid, exit.new);
+    assert!(!zone.is_empty() && zone.iter().all(|&i| passable_sea(&grid.cells[i])), "the moved exit is not open sea");
+    // ... that is connected to the sea the stock exit used and to the preserved south exit
+    let reach = sea_component(&grid, zone[0]);
+    let stock_exit_sea: Vec<usize> = cells_centred_in(&stock, exit.old).into_iter().filter(|&i| passable_sea(&stock.cells[i])).collect();
+    assert!(!stock_exit_sea.is_empty());
+    assert!(stock_exit_sea.iter().all(|&i| reach.contains(&old_to_new(i))), "the moved exit is walled off from the stock exit sea");
+    for ta in preserved.iter().filter(|t| t.id == 2) {
+        let south: Vec<usize> = cells_centred_in(&stock, ta.rect).into_iter().filter(|&i| passable_sea(&stock.cells[i])).collect();
+        assert!(!south.is_empty() && south.iter().all(|&i| reach.contains(&old_to_new(i))), "the moved exit cannot reach exit {}", ta.id);
+    }
+
+    // no stale mask: the old west frame (outside cells x -760..-750) is open sea along the exit and its neighbourhood
+    for i in 0..stock.cells.len() {
+        let o = stock.cell_origin(i);
+        let (cx, cy) = (o[0] + 1.0, o[1] + 1.0);
+        if -760.0 < cx && cx < -750.0 && (10.0..=120.0).contains(&cy) {
+            let cell = &grid.cells[old_to_new(i)];
+            assert!(!has_outside(cell) && passable_sea(cell), "stale outside frame at ({cx}, {cy})");
+        }
+    }
+
+    // preserved exits keep their exact cells
+    for ta in preserved.iter().filter(|t| t.id != exit.id) {
+        for i in cells_centred_in(&stock, ta.rect) {
+            assert_eq!(cell_kinds(&grid.cells[old_to_new(i)]), cell_kinds(&stock.cells[i]), "preserved exit {} changed", ta.id);
+        }
+    }
+    let new_problems = new_problems(&baseline, &grid, &rd);
+    assert!(new_problems.is_empty(), "{} new rule problems:\n{}", new_problems.len(), new_problems.iter().take(12).cloned().collect::<Vec<_>>().join("\n"));
+
+    // both files survive serialization with the moved exit, the preserved exits and the cleared frame intact
+    grid.store(&mut pff.root).unwrap();
+    let back = Grid::parse_area(&esf::read(&esf::write(&pff).unwrap()).unwrap().root, area).unwrap();
+    assert_eq!((back.cols, back.rows, back.x0, back.y0, back.origin_index), (grid.cols, grid.rows, grid.x0, grid.y0, grid.origin_index));
+    assert!(
+        back.cells.iter().zip(&grid.cells).all(|(a, b)| {
+            a.header == b.header && a.empty == b.empty && a.pieces.iter().map(|p| (p.a, p.b)).eq(b.pieces.iter().map(|p| (p.a, p.b)))
+        }),
+        "the extended grid changed through store / write / read / parse"
+    );
+    rd.store(&mut rf.root).unwrap();
+    let back = RegionData::parse(&esf::read(&esf::write(&rf).unwrap()).unwrap().root).unwrap();
+    assert_eq!(back.theatre_rect("1").unwrap(), change.new_rect);
+    let exits = back.transition_areas("1").unwrap();
+    assert_eq!(exits.iter().find(|t| t.id == exit.id).unwrap().rect, exit.new, "the moved exit was not stored");
+    for t in preserved.iter().filter(|t| t.id != exit.id) {
+        assert_eq!(exits.iter().find(|u| u.id == t.id).unwrap().rect, t.rect, "preserved exit {} changed on store", t.id);
+    }
+}
+
+/// A two-region world and grid with no external files: a passable ocean, an L-shaped impassable frame (a west band
+/// 16 units wide, wider than any fitted reach, plus a 4-unit south band that stays an edge frame), an isolated
+/// impassable square in the interior, and a land backdrop block on the west edge.
+fn synthetic_frame_world() -> (Grid, RegionData) {
+    use crate::regionmap::pathfinding::{Cell, TRANSITION};
+    use crate::regionmap::regions::{Area, Outline, Region};
+    let mut vertices: Vec<[f32; 2]> = Vec::new();
+    let mut region = |key: &str, kind: &str, areas: Vec<(bool, Vec<[f32; 2]>)>| -> Region {
+        let areas = areas
+            .into_iter()
+            .map(|(passable, ring)| {
+                let first = vertices.len() as u32;
+                vertices.extend_from_slice(&ring);
+                Area {
+                    land_bridge: false,
+                    channel_coast: false,
+                    passable,
+                    adjoining_id: 0,
+                    faces: vec![],
+                    outlines: vec![Outline { outer: true, ring: (first..first + ring.len() as u32).collect(), runs: vec![] }],
+                    impassable_id: if passable { 65535 } else { 286 },
+                    island_id: 0,
+                }
+            })
+            .collect();
+        Region { key: key.into(), kind: kind.into(), areas, tail: 0, settlement: None }
+    };
+    let regions = vec![
+        region("ocean", "sea", vec![(true, vec![[-30.0, -10.0], [50.0, -10.0], [50.0, 40.0], [-30.0, 40.0]])]),
+        region(
+            "impassable",
+            "sea",
+            vec![
+                (false, vec![[0.0, 0.0], [40.0, 0.0], [40.0, 4.0], [16.0, 4.0], [16.0, 20.0], [0.0, 20.0]]),
+                (false, vec![[24.0, 10.0], [30.0, 10.0], [30.0, 16.0], [24.0, 16.0]]),
+            ],
+        ),
+        region("backdrop", "land", vec![(false, vec![[0.0, 20.0], [16.0, 20.0], [16.0, 28.0], [0.0, 28.0]])]),
+    ];
+    let rd = RegionData { vertices, regions, theatres: vec![] };
+    let (cols, rows) = (20usize, 14usize);
+    let mut cells = Vec::new();
+    for r in 0..rows {
+        for c in 0..cols {
+            let (x, y) = (2.0 * c as f64 + 1.0, 2.0 * r as f64 + 1.0);
+            let outside = (x < 16.0 && y < 20.0) || y < 4.0 || (x < 16.0 && y >= 20.0) || (24.0 < x && x < 30.0 && 10.0 < y && y < 16.0);
+            cells.push(if outside {
+                Cell { header: [0x1f, 0xff, 0x1f, 0xff, 0xff, 0x1f, 0xff, 0x1f], pieces: vec![], empty: Some((2, TRANSITION)) }
+            } else {
+                Cell { header: [0x14; 8], pieces: vec![], empty: Some((0xff11_0111, 0)) }
+            });
+        }
+    }
+    let grid = Grid {
+        area: 0, x0: 0.0, y0: 0.0, size: 2.0, cols, rows,
+        origin_index: [640, 320], region_ids: vec![], paths: vec![vec![]], cells,
+        vertices: vec![[0, 0]; 4], polylines: [(0, vec![0, 2, 3, 1])].into(),
+    };
+    (grid, rd)
+}
+
+/// A moved west exit must reach the old sea whatever the width of the impassable frame that hugged the old edge;
+/// only that frame is released (down to its diagonal split against the unmoved south band): land backdrop on the old
+/// edge, the unmoved edge's band and an isolated interior impassable area keep their outside cells.
+#[test]
+fn frame_wider_than_any_fitted_reach_is_released_without_touching_other_outside_cells() {
+    use crate::regionmap::pathfinding::TransitionArea;
+    let (stock, rd) = synthetic_frame_world();
+    let mut grid = stock.clone();
+    let exit = TransitionArea { id: 1, old: [[0.0, 6.0], [4.0, 14.0]], new: [[-24.0, 6.0], [-20.0, 14.0]] };
+    let report = grid.extend([[-24.0, 0.0], [40.0, 28.0]], &rd, &[exit]).unwrap();
+    assert_eq!(report.offset, [12, 0]);
+    let new_index = |c: usize, r: usize| r * grid.cols + c + report.offset[0];
+    let in_frame = |c: usize, r: usize| {
+        let (x, y) = (2.0 * c as f64 + 1.0, 2.0 * r as f64 + 1.0);
+        (x < 16.0 && y < 20.0) || y < 4.0
+    };
+    let mut released = 0;
+    for r in 0..stock.rows {
+        for c in 0..stock.cols {
+            let cell = &grid.cells[new_index(c, r)];
+            if in_frame(c, r) && c < r {
+                // strictly nearer to the moved west edge than to the unmoved south edge
+                assert!(passable_sea(cell) && !has_outside(cell), "frame cell ({c}, {r}) kept its outside wall");
+                released += 1;
+            } else if in_frame(c, r) {
+                assert!(has_outside(cell), "unmoved south band cell ({c}, {r}) was released");
+            }
+        }
+    }
+    assert_eq!(report.frame_cells_to_sea, released);
+    assert!(grid.cells[new_index(7, 9)].empty.is_some_and(|(a, _)| a & 15 == 1), "the 14-unit-deep part of the frame must be released");
+    for r in 10..14 {
+        for c in 0..8 {
+            assert!(has_outside(&grid.cells[new_index(c, r)]), "land backdrop cell ({c}, {r}) was released");
+        }
+    }
+    for r in 5..8 {
+        for c in 12..15 {
+            assert!(has_outside(&grid.cells[new_index(c, r)]), "isolated impassable area cell ({c}, {r}) was released");
+        }
+    }
+    // the moved exit lies on new sea that is connected to the old sea through the released frame
+    let zone = cells_centred_in(&grid, exit.new);
+    assert!(!zone.is_empty() && zone.iter().all(|&i| passable_sea(&grid.cells[i])));
+    let reach = sea_component(&grid, zone[0]);
+    assert!(zone.iter().all(|i| reach.contains(i)));
+    assert!(reach.contains(&new_index(10, 5)), "the moved exit is walled off from the old sea");
+}
+
+/// India's enlarged east edge has no frame (the validated experiment output must not change): the exit slides to the new
+/// edge, every cell its partially covered window touches is either open sea or genuine outside (type 2, `TRANSITION`)
+/// navigation geometry, and the old window keeps no outside piece behind.
+#[test]
+fn india_extension_moves_the_east_exit_onto_coherent_navigation_geometry() {
+    use crate::regionmap::pathfinding::{TRANSITION, TransitionArea};
+    let (Some((pff, _)), Some((rf, _))) = (load(&vanilla_pf()), load(&vanilla_regions())) else {
+        eprintln!("skip: vanilla files missing");
+        return;
+    };
+    let mut rd = RegionData::parse(&rf.root).unwrap();
+    let stock = Grid::parse_area(&pff.root, AREA).unwrap();
+    let mut grid = stock.clone();
+    let change = rd.extend_theatre("3", [[440.0, -80.0], [790.0, 300.0]]).unwrap();
+    let moves: Vec<TransitionArea> = change.moved.iter().map(|m| TransitionArea { id: m.id, old: m.old, new: m.new }).collect();
+    assert_eq!(change.moved.iter().map(|m| m.id).collect::<Vec<_>>(), vec![11]);
+    let report = grid.extend(change.new_rect, &rd, &moves).unwrap();
+    assert_eq!((report.frame_cells_to_sea, report.frame_pieces_to_sea), (0, 0), "India has no impassable frame at its moved edges");
+    let exit = change.moved[0];
+    let old_to_new = |i: usize| (i / stock.cols + report.offset[1]) * grid.cols + i % stock.cols + report.offset[0];
+
+    // the 770.63..788.66 window is not cell aligned: every cell that overlaps it at all is considered
+    let touched: Vec<usize> = (0..grid.cells.len())
+        .filter(|&i| {
+            let o = grid.cell_origin(i);
+            let s = grid.size;
+            f64::from(exit.new[0][0]) < o[0] + s && o[0] < f64::from(exit.new[1][0]) && f64::from(exit.new[0][1]) < o[1] + s && o[1] < f64::from(exit.new[1][1])
+        })
+        .collect();
+    assert!(touched.len() > cells_centred_in(&grid, exit.new).len(), "the window must cut cells in two");
+    let (mut sea, mut outside) = (0, 0);
+    for &i in &touched {
+        let cell = &grid.cells[i];
+        if passable_sea(cell) {
+            sea += 1;
+        } else {
+            // new outside cells are whole type-2 runs of the TRANSITION path with the outside header
+            assert_eq!(cell.empty.map(|(a, id)| (a, id)), Some((0x0000_0002, TRANSITION)), "cell {i} of the moved exit is neither sea nor outside geometry: {cell:?}");
+            assert!(cell.pieces.is_empty() && has_outside(cell));
+            outside += 1;
+        }
+    }
+    assert!(sea > outside, "{sea} sea cells against {outside} outside cells in the moved exit window");
+    let reach = sea_component(&grid, *touched.iter().find(|&&i| passable_sea(&grid.cells[i])).unwrap());
+    assert!(touched.iter().filter(|&&i| passable_sea(&grid.cells[i])).all(|i| reach.contains(i)), "part of the moved east exit is cut off");
+
+    // the exit's old window keeps no outside piece (its sea is plain sea again)
+    for i in cells_centred_in(&stock, exit.old) {
+        assert!(grid.cells[old_to_new(i)].pieces.iter().all(|p| p.a & 15 != 2), "stale outside piece in the old east exit window, cell {i}");
+    }
+    // the unmoved west exit keeps its exact cells
+    for i in cells_centred_in(&stock, [[436.42, 17.49], [454.61, 105.5]]) {
+        assert_eq!(cell_kinds(&grid.cells[old_to_new(i)]), cell_kinds(&stock.cells[i]), "the preserved west exit changed at cell {i}");
+    }
+}
+
+/// The connected atlas accepts India's enlarged rectangle but America's original one: extending for an atlas project
+/// moves only India's east exit, and the atlas's uniform chart transform keeps the exit's inset from the theatre edge.
+#[test]
+fn atlas_project_moves_only_the_india_exit_and_the_chart_transform_keeps_its_inset() {
+    use crate::atlas::Plan;
+    use crate::model::Project;
+    use crate::regionmap::chain;
+    let Some((rf, _)) = load(&vanilla_regions()) else {
+        eprintln!("skip: vanilla regions missing");
+        return;
+    };
+    let mut rd = RegionData::parse(&rf.root).unwrap();
+    let america = (rd.theatre_rect("1").unwrap(), rd.transition_areas("1").unwrap());
+    let mut project = Project::default();
+    project.atlas = Some(Plan::proven());
+    let changes = chain::extend_for_project(&mut rd, &project).unwrap();
+    assert_eq!(changes.iter().map(|c| c.theatre.as_str()).collect::<Vec<_>>(), vec!["3"], "only India differs from the source rectangles");
+    assert_eq!((rd.theatre_rect("1").unwrap(), rd.transition_areas("1").unwrap()), america, "America keeps its rectangle and exits");
+    let change = &changes[0];
+    assert_eq!(change.moved.iter().map(|m| m.id).collect::<Vec<_>>(), vec![11]);
+    let exit = change.moved[0];
+    let plan = project.atlas.as_ref().unwrap();
+    let chart = plan.chart("3").unwrap();
+    let map = |p: [f32; 2]| plan.xy(p.map(f64::from), chart);
+    let (lo, hi) = (map(change.new_rect[0]), map(change.new_rect[1]));
+    let (elo, ehi) = (map(exit.new[0]), map(exit.new[1]));
+    assert!(lo[0] <= elo[0] && ehi[0] <= hi[0] && lo[1] <= elo[1] && ehi[1] <= hi[1], "the mapped exit leaves the mapped theatre");
+    let source_inset = f64::from(change.new_rect[1][0] - exit.new[1][0]) / f64::from(change.new_rect[1][0] - change.new_rect[0][0]);
+    let atlas_inset = (hi[0] - ehi[0]) / (hi[0] - lo[0]);
+    assert!((source_inset - atlas_inset).abs() < 1e-9, "the chart transform changed the exit's inset: {source_inset} vs {atlas_inset}");
 }
 
 /// Mixed corner-relative and absolute vertices expose half-cell shifts that whole-cell runs hide.

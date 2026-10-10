@@ -38,7 +38,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use crate::esf::{self, Node, Value};
 use crate::startpos::cai::nodes as nd;
-use crate::regionmap::geometry::{P, point_in_ring};
+use crate::regionmap::geometry::P;
 use crate::regionmap::regions::{RegionData, settlement_center};
 use crate::startpos::helpers::{IdAlloc, collect_used};
 
@@ -2652,7 +2652,7 @@ pub fn ensure_boundaries(root: &mut Node, rd: &RegionData, key: &str) -> Result<
 pub struct HlciRegionReport {
     pub key: String,
     pub cai_id: u32,
-    /// the HLCI ids the CAI region listed before / lists now (index = area index)
+    /// The HLCI ids the CAI region listed before / lists now (one per component).
     pub old: Vec<u32>,
     pub new: Vec<u32>,
     /// `(area index, component id)` per area
@@ -2670,19 +2670,12 @@ pub struct HlciReport {
     pub total: usize,
 }
 
-/// First outer ring of area `ai` of region `ri`.
-fn area_outer(rd: &RegionData, ri: usize, ai: usize) -> Option<Vec<P>> {
-    rd.regions[ri].areas[ai]
-        .outlines
-        .iter()
-        .find(|o| o.outer)
-        .map(|o| o.ring.iter().map(|&v| rd.v(v)).collect())
-}
 
 struct ExHlci {
     id: u32,
     comp: u32,
     pt: P,
+    area: Option<usize>,
     /// index into `CAI_WORLD_REGION_HLCIS`
     at: usize,
 }
@@ -2691,18 +2684,44 @@ fn fixed64(v: f64) -> i32 {
     (v * FIXED).round() as i32
 }
 
-/// Rebuild the `CAI_REGION_HLCI` records of regions whose area list changed (port of `work/exp5/hlci_fix.py`). A
-/// `CAI_REGION_HLCI` is `[region CAI id, area component id, [area index], x, y]` (12.20 fixed point) and a region needs
-/// exactly one per `regions.esf` area; the engine's "Post Load Fixup A: Region HLCIs" rejects the start position
-/// otherwise. For every region in `keys` (with `keys` empty: every region whose HLCI count differs from its area count):
+fn hlci_layout_matches(
+    cai_id: u32,
+    areas: &[super::regions::Area],
+    listed: &[u32],
+    by_id: &HashMap<u32, usize>,
+    hlcis: &[Vec<Node>],
+) -> Result<bool> {
+    let mut covered = vec![false; areas.len()];
+    let mut components = BTreeSet::new();
+    for id in listed {
+        let Some(&at) = by_id.get(id) else { return Ok(false) };
+        let s = nd::spec_kids(&hlcis[at])?;
+        let component = nd::sc_at(s, 1)?;
+        if nd::sc_at(s, 0)? != cai_id || !components.insert(component) {
+            return Ok(false);
+        }
+        let indices = nd::arr_at(s, 2)?;
+        if indices.is_empty() {
+            return Ok(false);
+        }
+        for ai in indices {
+            let Some(area) = areas.get(ai as usize) else { return Ok(false) };
+            if area.adjoining_id as u32 != component || covered[ai as usize] {
+                return Ok(false);
+            }
+            covered[ai as usize] = true;
+        }
+    }
+    Ok(covered.into_iter().all(|v| v))
+}
+
+/// Rebuild region HLCIs in the stock shape: `[region CAI id, component id, [area indices], x, y]`,
+/// with one record per distinct component and every area covered exactly once.
 ///
-/// * each area takes, in this order, the existing unused HLCI at the settlement position (the settlement's area; the
-///   point becomes the settlement position), else the one with the area's component id, else one whose point lies in
-///   the area, else any unused one, else a clone (fresh CAI id from `CAI_CENTRAL_BDI_POOL`, appended to
-///   `CAI_WORLD_REGION_HLCIS`);
-/// * component id and area index come from `rd`; the point of a non-settlement area stays when it lies inside the
-///   area, else it moves to the area's pole of inaccessibility;
-/// * surplus HLCIs leave the region's list and `CAI_WORLD_REGION_HLCIS`.
+/// Explicit `keys` force reconstruction after geometry edits. Empty `keys` repairs only invalid groups;
+/// valid multi-area groups keep their original records and representatives.
+/// Settlement representatives and existing component ids are preferred, then an existing point in the group.
+/// Missing groups receive fresh CAI ids; surplus records are removed.
 pub fn rebuild_region_hlcis(root: &mut Node, rd: &RegionData, keys: &[String]) -> Result<HlciReport> {
     let ci = root.path_mut(&["CAMPAIGN_ENV", "CAMPAIGN_MODEL", "CAI_INTERFACE"])?;
     let next = nd::sc_at(nd::kids(nd::get(ci, &["CAI_CENTRAL_BDI_POOL"])?)?, 0)?;
@@ -2736,27 +2755,39 @@ pub fn rebuild_region_hlcis(root: &mut Node, rd: &RegionData, keys: &[String]) -
             }
             let Ok(ri) = rd.index(key) else { continue };
             let areas = &rd.regions[ri].areas;
-            if keys.is_empty() && listed.len() == areas.len() {
+            if keys.is_empty() && hlci_layout_matches(*cai_id, areas, listed, &by_id, hl)? {
                 continue;
             }
             let sett = settlement_center(&rd.regions[ri]).ok().map(|p| [p[0] as f64, p[1] as f64]);
+            let settlement_area = sett.and_then(|p| rd.area_at(ri, p));
+            let mut groups: Vec<(u32, Vec<u32>)> = Vec::new();
+            let mut group_index = HashMap::new();
+            for (ai, area) in areas.iter().enumerate() {
+                let comp = area.adjoining_id as u32;
+                let gi = *group_index.entry(comp).or_insert_with(|| {
+                    groups.push((comp, Vec::new()));
+                    groups.len() - 1
+                });
+                groups[gi].1.push(ai as u32);
+            }
             let mut ex: Vec<ExHlci> = Vec::new();
             for id in listed {
                 let Some(&at) = by_id.get(id) else { continue };
                 let s = nd::spec_kids(&hl[at])?;
+                let pt = [fixed_of(&s[3])? as f64 / FIXED, fixed_of(&s[4])? as f64 / FIXED];
                 ex.push(ExHlci {
                     id: *id,
                     comp: nd::sc_at(s, 1)?,
-                    pt: [fixed_of(&s[3])? as f64 / FIXED, fixed_of(&s[4])? as f64 / FIXED],
+                    pt,
+                    area: rd.area_at(ri, pt),
                     at,
                 });
             }
             let mut used: HashSet<u32> = HashSet::new();
             let mut new_ids: Vec<u32> = Vec::new();
-            for (ai, area) in areas.iter().enumerate() {
-                let comp = area.adjoining_id as u32;
-                let outer = area_outer(rd, ri, ai);
-                let sett_here = sett.filter(|s| outer.as_ref().is_some_and(|o| point_in_ring(*s, o)));
+            for (comp, indices) in &groups {
+                let in_group = |ai: Option<usize>| ai.is_some_and(|ai| indices.contains(&(ai as u32)));
+                let sett_here = sett.filter(|_| in_group(settlement_area));
                 let mut pick: Option<usize> = None;
                 if let Some(s) = sett_here {
                     pick = ex
@@ -2764,19 +2795,21 @@ pub fn rebuild_region_hlcis(root: &mut Node, rd: &RegionData, keys: &[String]) -
                         .position(|e| !used.contains(&e.id) && (e.pt[0] - s[0]).abs() < 1e-3 && (e.pt[1] - s[1]).abs() < 1e-3);
                 }
                 if pick.is_none() {
-                    pick = ex.iter().position(|e| !used.contains(&e.id) && e.comp == comp);
+                    pick = ex.iter().position(|e| !used.contains(&e.id) && e.comp == *comp);
                 }
                 if pick.is_none() {
-                    if let Some(o) = &outer {
-                        pick = ex.iter().position(|e| !used.contains(&e.id) && point_in_ring(e.pt, o));
-                    }
+                    pick = ex.iter().position(|e| !used.contains(&e.id) && in_group(e.area));
                 }
-                let point: P = match (sett_here, pick, &outer) {
-                    (Some(s), _, _) => s,
-                    (None, Some(k), Some(o)) if point_in_ring(ex[k].pt, o) => ex[k].pt,
-                    (None, _, Some(_)) => rd.pole_of_inaccessibility(ri, ai),
-                    (None, Some(k), None) => ex[k].pt,
-                    (None, None, None) => bail!("{key}: area {ai} has no outer ring"),
+                let point = match (sett_here, pick) {
+                    (Some(s), _) => s,
+                    (None, Some(k)) if in_group(ex[k].area) => ex[k].pt,
+                    _ => match indices.iter().copied().find(|&ai| areas[ai as usize].outlines.iter().any(|o| o.outer)) {
+                        Some(ai) => rd.pole_of_inaccessibility(ri, ai as usize),
+                        None => match pick {
+                            Some(k) => ex[k].pt,
+                            None => bail!("{key}: component {comp} has no outer ring"),
+                        },
+                    },
                 };
                 let (id, at) = match pick {
                     Some(k) => (ex[k].id, ex[k].at),
@@ -2797,8 +2830,8 @@ pub fn rebuild_region_hlcis(root: &mut Node, rd: &RegionData, keys: &[String]) -
                 used.insert(id);
                 let h = nd::spec_kids_mut(&mut hl[at])?;
                 set_id(&mut h[0], *cai_id)?;
-                set_id(&mut h[1], comp)?;
-                nd::put(h, 2, nd::arrn(&[ai as u32]))?;
+                set_id(&mut h[1], *comp)?;
+                nd::put(h, 2, nd::arrn(indices))?;
                 nd::put(h, 3, nd::i32n(fixed64(point[0])))?;
                 nd::put(h, 4, nd::i32n(fixed64(point[1])))?;
                 new_ids.push(id);
@@ -2822,6 +2855,15 @@ pub fn rebuild_region_hlcis(root: &mut Node, rd: &RegionData, keys: &[String]) -
         }
         report.total = hl.len();
     }
+    if !removed.is_empty() {
+        for (index, item) in world_items(world, "CAI_WORLD_TRADE_ROUTE_SEGMENTS")?.iter().enumerate() {
+            let reference = nd::sc_at(nd::spec_kids(item)?, 1)?;
+            ensure!(
+                !removed.contains(&reference) || reference as usize == index,
+                "CAI trade-route segment {index} still references removed HLCI {reference}"
+            );
+        }
+    }
     let items = world_items_mut(world, "CAI_WORLD_REGIONS")?;
     for (index, ids) in updates {
         nd::put(nd::spec_kids_mut(&mut items[index])?, 1, nd::arrn(&ids))?;
@@ -2844,10 +2886,6 @@ pub struct MapChecks<'a> {
     pub pathfinding_regions: &'a [Vec<i16>],
     /// number of cells of the sea grid; `None` skips the check
     pub sea_grid_cells: Option<usize>,
-    /// regions that must have exactly one HLCI per area; `None` = every region. Every other region may have fewer
-    /// HLCIs than areas: the ETW-derived regions of the generated start position do (islets and clipped sea parts have
-    /// none; the game loads them), but surplus, duplicate or out-of-range HLCIs are always problems.
-    pub exact_hlci: Option<BTreeSet<String>>,
 }
 
 impl<'a> MapChecks<'a> {
@@ -2885,13 +2923,7 @@ impl<'a> MapChecks<'a> {
                 theatre_of.insert(it[0].as_str()?.to_string(), idx);
             }
         }
-        Ok(Self { regions, theatre_of, pathfinding_regions, sea_grid_cells, exact_hlci: None })
-    }
-
-    /// Demand one HLCI per area only of `keys` (the regions whose areas the build changed).
-    pub fn exact_hlci_of(mut self, keys: impl IntoIterator<Item = String>) -> Self {
-        self.exact_hlci = Some(keys.into_iter().collect());
-        self
+        Ok(Self { regions, theatre_of, pathfinding_regions, sea_grid_cells })
     }
 }
 
@@ -2920,8 +2952,8 @@ fn count_named(n: &Node, name: &str) -> usize {
 /// (which compares against the vanilla start position) cannot see.
 ///
 /// * `CAI_WORLD_REGIONS[i]` is the region `regions.esf` has at index `i` (and both lists have the same length);
-/// * every region lists exactly one HLCI per area ([`MapChecks::exact_hlci`]); each HLCI exists once, belongs to the region, has a distinct area
-///   index below the area count and the component id of that area; no HLCI is listed by two regions or by none;
+/// * every component of every region has one HLCI containing all its area indices; each area is covered exactly
+///   once, each HLCI belongs to its region, and no HLCI is listed by two regions or by none;
 /// * `CAI_SEA_GRID_CELL` count == `sea_grid_cells`;
 /// * every settled region is in the pathfinding region list of the theatre that lists it.
 pub fn check_world(root: &Node, map: &MapChecks<'_>) -> Result<Vec<String>> {
@@ -2960,11 +2992,8 @@ pub fn check_world(root: &Node, map: &MapChecks<'_>) -> Result<Vec<String>> {
         };
         let areas = &rd.regions[ri].areas;
         let listed = nd::arr_at(nd::spec_kids(it)?, 1)?;
-        let exact = map.exact_hlci.as_ref().is_none_or(|set| set.contains(key));
-        if listed.len() > areas.len() || (exact && listed.len() != areas.len()) {
-            problems.push(format!("{key}: {} HLCIs for {} areas", listed.len(), areas.len()));
-        }
         let mut seen: BTreeSet<u32> = BTreeSet::new();
+        let mut components = BTreeSet::new();
         for id in &listed {
             if let Some(other) = listed_by.insert(*id, cai_id) {
                 problems.push(format!("{key}: HLCI {id} is also listed by CAI region {other}"));
@@ -2977,24 +3006,33 @@ pub fn check_world(root: &Node, map: &MapChecks<'_>) -> Result<Vec<String>> {
             if nd::sc_at(s, 0)? != cai_id {
                 problems.push(format!("{key}: HLCI {id} belongs to CAI region {}", nd::sc_at(s, 0)?));
             }
-            let idx = nd::arr_at(s, 2)?;
-            let [ai] = idx[..] else {
-                problems.push(format!("{key}: HLCI {id} has {} area indices", idx.len()));
-                continue;
-            };
-            let Some(area) = areas.get(ai as usize) else {
-                problems.push(format!("{key}: HLCI {id} names area {ai}, the region has {}", areas.len()));
-                continue;
-            };
-            if !seen.insert(ai) {
-                problems.push(format!("{key}: two HLCIs for area {ai}"));
+            let comp = nd::sc_at(s, 1)?;
+            if !components.insert(comp) {
+                problems.push(format!("{key}: multiple HLCIs for component {comp}"));
             }
-            if nd::sc_at(s, 1)? != area.adjoining_id as u32 {
-                problems.push(format!(
-                    "{key}: HLCI {id} component {} but area {ai} has component {}",
-                    nd::sc_at(s, 1)?,
-                    area.adjoining_id
-                ));
+            let indices = nd::arr_at(s, 2)?;
+            if indices.is_empty() {
+                problems.push(format!("{key}: HLCI {id} covers no areas"));
+            }
+            for ai in indices {
+                let Some(area) = areas.get(ai as usize) else {
+                    problems.push(format!("{key}: HLCI {id} names area {ai}, the region has {}", areas.len()));
+                    continue;
+                };
+                if !seen.insert(ai) {
+                    problems.push(format!("{key}: area {ai} is covered more than once"));
+                }
+                if comp != area.adjoining_id as u32 {
+                    problems.push(format!(
+                        "{key}: HLCI {id} component {comp} but area {ai} has component {}",
+                        area.adjoining_id
+                    ));
+                }
+            }
+        }
+        for ai in 0..areas.len() {
+            if !seen.contains(&(ai as u32)) {
+                problems.push(format!("{key}: area {ai} has no HLCI"));
             }
         }
     }
@@ -3049,16 +3087,6 @@ mod tests {
             .collect()
     }
 
-    /// regions whose HLCI count differs from the area count
-    fn mismatched(root: &Node, rd: &RegionData) -> Vec<(String, usize, usize)> {
-        cai_regions(root)
-            .into_iter()
-            .filter_map(|(k, l)| {
-                let n = rd.regions[rd.index(&k).unwrap()].areas.len();
-                (l.len() != n).then_some((k, l.len(), n))
-            })
-            .collect()
-    }
 
     fn hlci_fields(root: &Node, id: u32) -> (u32, Vec<u32>, i32, i32) {
         let world = root.path(&["CAMPAIGN_ENV", "CAMPAIGN_MODEL", "CAI_INTERFACE", "CAI_WORLD"]).unwrap();
@@ -3069,6 +3097,136 @@ mod tests {
             .unwrap();
         let s = nd::spec_kids(it).unwrap();
         (nd::sc_at(s, 1).unwrap(), nd::arr_at(s, 2).unwrap(), fixed_of(&s[3]).unwrap(), fixed_of(&s[4]).unwrap())
+    }
+
+    fn hlci_fixture(components: &[u16], groups: &[(u32, &[u32])]) -> (esf::Esf, RegionData) {
+        use super::super::regions::{Area, Outline, Region};
+        let mut rd = RegionData { vertices: Vec::new(), regions: Vec::new(), theatres: Vec::new() };
+        let mut areas = Vec::new();
+        for (ai, &component) in components.iter().enumerate() {
+            let base = rd.vertices.len() as u32;
+            let x = ai as f32 * 20.0;
+            rd.vertices.extend([[x, 0.0], [x + 10.0, 0.0], [x + 10.0, 10.0], [x, 10.0]]);
+            areas.push(Area {
+                land_bridge: false, channel_coast: false, passable: true, adjoining_id: component,
+                faces: vec![[base, base + 1, base + 2], [base, base + 2, base + 3]],
+                outlines: vec![Outline { outer: true, ring: (base..base + 4).collect(), runs: Vec::new() }],
+                impassable_id: u16::MAX, island_id: 0,
+            });
+        }
+        rd.regions.push(Region { key: "sea".into(), kind: "sea".into(), areas, tail: -1, settlement: None });
+        let mut region = vec![nd::u32n(0); 11];
+        let ids: Vec<u32> = (100..100 + groups.len() as u32).collect();
+        region[1] = nd::arrn(&ids);
+        region[10] = Node::Value(Value::String16("sea".into()));
+        let hlcis = groups.iter().enumerate().map(|(i, &(component, indices))| {
+            let x = indices.first().copied().unwrap_or(0) as f64 * 20.0 + 5.0;
+            vec![nd::u32n(ids[i]), Node::record("CAI_REGION_HLCI", 0, vec![
+                nd::u32n(50), nd::u32n(component), nd::arrn(indices),
+                nd::i32n(fixed64(x)), nd::i32n(fixed64(5.0)),
+            ])]
+        }).collect();
+        let world = Node::record("CAI_WORLD", 0, vec![
+            Node::array("CAI_WORLD_REGIONS", 0, vec![vec![nd::u32n(50), Node::record("CAI_REGION", 0, region)]]),
+            Node::array("CAI_WORLD_REGION_HLCIS", 0, hlcis),
+            Node::array("CAI_WORLD_TRADE_ROUTE_SEGMENTS", 0, Vec::new()),
+        ]);
+        let ci = Node::record("CAI_INTERFACE", 0, vec![
+            world, Node::record("CAI_CENTRAL_BDI_POOL", 0, vec![nd::u32n(1000)]),
+        ]);
+        let root = Node::record("ROOT", 0, vec![Node::record("CAMPAIGN_ENV", 0, vec![
+            Node::record("CAMPAIGN_MODEL", 0, vec![ci]),
+        ])]);
+        (esf::Esf { timestamp: 1, names: Vec::new(), root }, rd)
+    }
+
+    fn hlci_shape(root: &Node) -> Vec<(u32, Vec<u32>)> {
+        cai_regions(root)[0].1.iter().map(|&id| {
+            let (component, indices, _, _) = hlci_fields(root, id);
+            (component, indices)
+        }).collect()
+    }
+
+    fn hlci_problems(root: &Node, rd: &RegionData) -> Vec<String> {
+        check_world(root, &MapChecks {
+            regions: rd, theatre_of: BTreeMap::new(), pathfinding_regions: &[], sea_grid_cells: None,
+        }).unwrap()
+    }
+
+    #[test]
+    fn valid_multi_area_hlcis_are_preserved_byte_for_byte() {
+        let (mut file, rd) = hlci_fixture(&[31, 31, 110], &[(31, &[0, 1]), (110, &[2])]);
+        let before = esf::write(&file).unwrap();
+        rebuild_region_hlcis(&mut file.root, &rd, &[]).unwrap();
+        assert_eq!(esf::write(&file).unwrap(), before);
+        assert_eq!(hlci_problems(&file.root, &rd), Vec::<String>::new());
+    }
+
+    #[test]
+    fn newly_passable_sea_areas_share_one_existing_component_hlci() {
+        let (mut file, rd) = hlci_fixture(
+            &[31, 31, 31, 31, 31], &[(31, &[0, 1]), (110, &[2]), (111, &[3]), (112, &[4])],
+        );
+        let report = rebuild_region_hlcis(&mut file.root, &rd, &[]).unwrap();
+        assert_eq!(hlci_shape(&file.root), vec![(31, vec![0, 1, 2, 3, 4])]);
+        assert_eq!(hlci_fields(&file.root, 100), (31, vec![0, 1, 2, 3, 4], fixed64(5.0), fixed64(5.0)));
+        assert_eq!(report.removed, vec![101, 102, 103]);
+        assert_eq!(report.created, Vec::<u32>::new());
+        let bytes = esf::write(&file).unwrap();
+        let back = esf::read(&bytes).unwrap();
+        assert_eq!(hlci_shape(&back.root), vec![(31, vec![0, 1, 2, 3, 4])]);
+        assert_eq!(hlci_problems(&back.root, &rd), Vec::<String>::new());
+        rebuild_region_hlcis(&mut file.root, &rd, &[]).unwrap();
+        assert_eq!(esf::write(&file).unwrap(), bytes);
+    }
+
+    #[test]
+    fn separated_components_allocate_distinct_hlcis_and_advance_the_pool() {
+        let (mut file, rd) = hlci_fixture(&[31, 110, 111], &[(31, &[0, 1, 2])]);
+        let report = rebuild_region_hlcis(&mut file.root, &rd, &[]).unwrap();
+        assert_eq!(hlci_shape(&file.root), vec![(31, vec![0]), (110, vec![1]), (111, vec![2])]);
+        assert_eq!(report.created, vec![1000, 1001]);
+        let pool = file.root.path(&["CAMPAIGN_ENV", "CAMPAIGN_MODEL", "CAI_INTERFACE", "CAI_CENTRAL_BDI_POOL"]).unwrap();
+        assert_eq!(nd::sc_at(nd::kids(pool).unwrap(), 0).unwrap(), 1002);
+        for id in cai_regions(&file.root)[0].1.iter().copied() {
+            let (_, indices, x, y) = hlci_fields(&file.root, id);
+            assert_eq!(rd.area_at(0, [x as f64 / FIXED, y as f64 / FIXED]), Some(indices[0] as usize));
+        }
+        assert_eq!(hlci_problems(&file.root, &rd), Vec::<String>::new());
+    }
+
+    #[test]
+    fn equal_hlci_and_area_counts_do_not_hide_stale_indices() {
+        let (mut file, rd) = hlci_fixture(&[31, 110, 111], &[(31, &[0]), (110, &[1]), (111, &[99])]);
+        assert_eq!(hlci_problems(&file.root, &rd).len(), 2);
+        rebuild_region_hlcis(&mut file.root, &rd, &[]).unwrap();
+        assert_eq!(hlci_shape(&file.root), vec![(31, vec![0]), (110, vec![1]), (111, vec![2])]);
+        assert_eq!(hlci_problems(&file.root, &rd), Vec::<String>::new());
+    }
+
+    #[test]
+    fn hlci_validation_rejects_duplicate_components_and_invalid_area_coverage() {
+        let cases: &[(&[(u32, &[u32])], usize)] = &[
+            (&[(31, &[0]), (31, &[1])], 1),
+            (&[(31, &[0, 0])], 2),
+            (&[(31, &[0, 2])], 2),
+            (&[(31, &[0])], 1),
+            (&[(110, &[0, 1])], 2),
+        ];
+        for &(groups, violations) in cases {
+            let (file, rd) = hlci_fixture(&[31, 31], groups);
+            assert_eq!(hlci_problems(&file.root, &rd).len(), violations, "{groups:?}");
+        }
+    }
+
+    #[test]
+    fn removing_an_hlci_with_a_live_trade_segment_reference_is_rejected() {
+        let (mut file, rd) = hlci_fixture(&[31, 31], &[(31, &[0]), (110, &[1])]);
+        let world = file.root.path_mut(&["CAMPAIGN_ENV", "CAMPAIGN_MODEL", "CAI_INTERFACE", "CAI_WORLD"]).unwrap();
+        world_items_mut(world, "CAI_WORLD_TRADE_ROUTE_SEGMENTS").unwrap().push(vec![
+            nd::u32n(200), Node::record("CAI_TRADE_ROUTE_SEGMENT", 0, vec![nd::u32n(0), nd::u32n(101)]),
+        ]);
+        assert!(rebuild_region_hlcis(&mut file.root, &rd, &[]).is_err());
     }
 
     #[test]
@@ -3099,59 +3257,11 @@ mod tests {
         for (id, area) in [(312, 1), (313, 2), (314, 3)] {
             assert_eq!(hlci_fields(&sp.root, id).1, vec![area]);
         }
-        // the regions the build did not touch keep the ETW-derived deficits the game loads (see `MapChecks::exact_hlci`)
-        assert!(mismatched(&sp.root, &rd).iter().all(|m| m.0 != "indochina" && m.1 < m.2));
         let bytes = esf::write(&sp).unwrap();
         assert!(bytes == std::fs::read(format!("{dir}/campaigns/wld_napoleon/startpos.esf")).unwrap(), "rebuilt startpos differs from the validated one");
         assert_eq!(esf::write(&golden).unwrap(), bytes);
     }
 
-    #[test]
-    fn hlci_rebuild_repairs_the_full_exp5_startpos() {
-        let (Some(mut sp), Some(regions)) = (
-            load(&format!("{EXP5}/out/data/campaigns/wld_napoleon/startpos.esf")),
-            load(&format!("{EXP5}/out/data/campaign_maps/nap_world/regions.esf")),
-        ) else {
-            return;
-        };
-        let rd = RegionData::parse(&regions.root).unwrap();
-        let before = mismatched(&sp.root, &rd);
-        eprintln!("HLCI count != area count before: {before:?}");
-        assert!(!before.is_empty());
-        let root = &mut sp.root;
-        let keys: Vec<String> = ["indochina", "unexplorable", "sumatra"].map(String::from).to_vec();
-        let report = rebuild_region_hlcis(root, &rd, &keys).unwrap();
-        for r in &report.regions {
-            eprintln!("{}: {} -> {} HLCIs, {} areas", r.key, r.old.len(), r.new.len(), r.areas.len());
-        }
-        eprintln!("removed {:?}, created {:?}, total {}", report.removed, report.created, report.total);
-        // the three regions are exact; the other regions keep the ETW-derived deficits (fewer HLCIs than areas, which
-        // the game loads: the validated Burma start position has them too)
-        let left = mismatched(root, &rd);
-        assert!(left.iter().all(|m| !keys.contains(&m.0) && m.1 < m.2), "{left:?}");
-        // rebuilding with no keys repairs every remaining region, and a second pass finds nothing to do
-        let all = rebuild_region_hlcis(root, &rd, &[]).unwrap();
-        assert_eq!(all.regions.len(), left.len());
-        assert!(mismatched(root, &rd).is_empty());
-        let again = rebuild_region_hlcis(root, &rd, &[]).unwrap();
-        assert!(again.regions.is_empty() && again.created.is_empty() && again.removed.is_empty());
-        // survives a write / read cycle
-        let bytes = esf::write(&sp).unwrap();
-        let back = esf::read(&bytes).unwrap();
-        assert_eq!(esf::write(&back).unwrap(), bytes);
-        let root = &back.root;
-        // the full consistency check with the exp5 pathfinding region lists and sea grid
-        let pf = load(&format!("{EXP5}/out/data/campaign_maps/nap_world/pathfinding.esf")).unwrap();
-        let lists: Vec<Vec<i16>> = (0..crate::regionmap::pathfinding::Grid::area_count(&pf.root).unwrap())
-            .map(|i| crate::regionmap::pathfinding::Grid::parse_area(&pf.root, i).unwrap().region_ids)
-            .collect();
-        let sea = load(&format!("{EXP5}/out/data/campaign_maps/nap_world/sea_grids.esf")).unwrap();
-        let cells: usize = crate::regionmap::sea_grids::SeaGrids::parse(&sea.root).unwrap().grids.iter().map(|g| g.cells.len()).sum();
-        let map = MapChecks::new(&rd, &regions.root, &lists, Some(cells)).unwrap();
-        let problems = check_world(root, &map).unwrap();
-        eprintln!("check_world: {} problems: {problems:#?}", problems.len());
-        assert!(problems.is_empty(), "{problems:#?}");
-    }
 
     #[test]
     fn ensure_boundaries_adds_a_missing_land_border_once() {

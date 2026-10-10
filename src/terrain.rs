@@ -4,7 +4,7 @@
 //! Optional generated extras of earlier experiments (`display/world.markers`, `display/traderoutes/*`) are intentionally
 //! NOT produced: the accepted installation ships neither.
 
-mod art;
+pub(crate) mod art;
 mod fixed_art;
 pub mod formats;
 mod raster;
@@ -633,19 +633,20 @@ fn step_env_props(snapshot: &Snapshot, display: &Path, progress: &Progress) -> R
 // ---------------------------------------------------------------------------------------------- driver
 
 /// Build `<map_dir>/display/**` and the theatre TGAs of `<map_dir>`; returns the TGA names written to the map root.
-/// `art_cache` is the workspace-owned terrain cache directory holding the locally generated fixed theatre art
-/// (`<art_cache>/fixed_art`); it is generated from the snapshot's ETW supertexture/heightmap once per unchanged source.
+/// `art_cache` holds source-bound local artwork. India is extended in both supported layouts; America's
+/// extension is applied only when its source theatre is extended, never for the atlas's original America bounds.
 pub fn build_display(
     snapshot: &Snapshot,
     map_dir: &Path,
     region_keys: &BTreeSet<String>,
     relief: &TerrainRelief,
     art_cache: &Path,
+    extend_america: bool,
     progress: &Progress,
 ) -> Result<Vec<String>> {
     let display = map_dir.join("display");
     fs::create_dir_all(&display)?;
-    let fixed = fixed_art::FixedArt::load_or_generate(snapshot, art_cache, progress)?;
+    let fixed = fixed_art::FixedArt::load_or_generate(snapshot, art_cache, extend_america, progress)?;
     let tgas = step_root_tgas(snapshot, map_dir, progress)?;
     let heightmap = step_heightmap(snapshot, &display, relief, &fixed, progress)?;
     step_supertexture(snapshot, &display, &fixed, progress)?;

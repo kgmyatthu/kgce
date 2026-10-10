@@ -30,6 +30,21 @@ USAGE
   KgcPortEditor build [--project FILE] [--workspace DIR] [--assets DIR]
   KgcPortEditor inspect --startpos FILE
 
+CONNECTED ATLAS AND BUILDING SCALE
+  KgcPortEditor atlas show|proven|off [--project FILE] [--workspace DIR]
+  KgcPortEditor atlas buildings --building-scale 0.1-1.0 [--project FILE] [--workspace DIR]
+    proven selects the stock-executable 1.3516979217529297x atlas and 0.5 building scale.
+    Europe and India stay connected. The exact experimental crops and theatre arrangement are saved in the project.
+    off changes only the map layout. Scale 1.0 emits no shader pack; remove previously installed overrides manually.
+    Export requires a new campaign for layout/settlement changes. The separate building movie pack affects all campaigns.
+
+SETTLEMENT MOVEMENT (source-space coordinates; same passable region area, clearance and spacing required)
+  KgcPortEditor settlement list [--project FILE]
+  KgcPortEditor settlement set --region KEY --slot ID --center x,y [--project FILE] [--workspace DIR]
+  KgcPortEditor settlement remove --region KEY --slot ID [--project FILE] [--workspace DIR]
+    list shows saved moves. IDs are settlement:REGION:NAME or town:REGION:NAME (unambiguous names also accepted).
+    Capitals carry their building-slot cluster. Ports cannot be moved. Ownership map also supports click-drag and undo.
+
 TSV TARGET DATA (RPFM-exported TSV tables; the folder is only read and stored as an immutable, hash-verified dataset)
   KgcPortEditor tables requirements [--project FILE] [--workspace DIR] [--assets DIR]
   KgcPortEditor tables preview --folder DIR --language CODE [--name NAME] [--resources-reviewed] [--with-extras] [--project FILE] [--workspace DIR] [--assets DIR]
@@ -46,9 +61,9 @@ TSV TARGET DATA (RPFM-exported TSV tables; the folder is only read and stored as
     (land/naval unit stats, existing faction identities, ...). `preview` parses the folder and reports parse
     errors and missing required tables (exit 3 when it would refuse). --language CODE names the language of the
     target text; full text/localisation.loc and text/ui.loc TSVs are required.
-    --resources-reviewed confirms you know TSVs carry no campaign/UI/script resources (unprovided ones use the
-    original conversion templates; merged resources can be added with `adapter import`). Without it `build` stays
-    blocked. `use --target` selects TSV mode with that exact dataset; a project in TSV mode without a dataset
+    --resources-reviewed records that you reviewed the campaign/UI/script resources (unprovided ones use the
+    original conversion templates; merged resources can be added with `adapter import`). Without it analysis
+    warns but export is allowed. `use --target` selects TSV mode with that exact dataset; a project in TSV mode without a dataset
     cannot build. `check` exits 4 when the TSV folder differs from the stored dataset.
 
 ANALYSIS AND REVIEW (never writes to a game folder)
@@ -112,10 +127,11 @@ WILDERNESS ACTIVATION (turn a wilderness_* land polygon of a playable theatre (w
     must then be a new key, --name/--settlement-name/--center/--donor describe the new region (the donor supplies the rules and settlement
     slots). The settlement point must keep at least 2.1 u from the outline of its area.
 
-FIXED THEATRE BOUNDS
-  KgcPortEditor theatre list [--workspace DIR]
-    Read-only: Europe stays original; India covers Thailand and Indonesia; America includes Western Plains.
-    Bounds are built in and cannot be set or reset by a project. Preview and export use the same rectangles.
+THEATRE BOUNDS
+  KgcPortEditor theatre list [--project FILE] [--workspace DIR]
+    Read-only source and output bounds for the selected layout; arbitrary rectangles are not supported.
+    Without the atlas: Europe stays original, India covers Thailand/Indonesia, America includes Western Plains.
+    The proven atlas instead reproduces its experimental source crops, including America x=-760..-340.
     Fixed terrain is generated natively from your Empire originals and public elevation data on first export, then cached locally.
     terrain set --painted DIR is an optional advanced override (--painted none clears it).
 
@@ -176,9 +192,11 @@ const VALUE_OPTIONS: &[&str] = &[
     "--areas",
     "--carve-from",
     "--painted",
+    "--building-scale",
+    "--slot",
 ];
-const FLAGS: &[&str] = &["--vanilla", "--pin", "--replace", "--resources-reviewed", "--merge"];
-const SUBCOMMANDS: &[&str] = &["tables", "mapping", "resolve", "adapter", "project", "split", "terrain", "activate", "theatre"];
+const FLAGS: &[&str] = &["--vanilla", "--pin", "--replace", "--resources-reviewed", "--with-extras", "--merge"];
+const SUBCOMMANDS: &[&str] = &["tables", "mapping", "resolve", "adapter", "project", "split", "terrain", "activate", "theatre", "atlas", "settlement"];
 
 fn main() {
     if let Err(error) = run() {
@@ -374,6 +392,8 @@ fn run() -> Result<()> {
         "terrain" => terrain(&env, &args),
         "activate" => activate(&env, &args),
         "theatre" => theatre(&env, &args),
+        "atlas" => atlas(&env, &args),
+        "settlement" => settlement(&env, &args),
         "project" => match args.sub.as_deref() {
             Some("show") => {
                 println!("{}", serde_json::to_string_pretty(&env.load_project()?)?);
@@ -609,13 +629,77 @@ fn activate(env: &Env<'_>, args: &Args) -> Result<()> {
 }
 
 
+fn atlas(env: &Env<'_>, args: &Args) -> Result<()> {
+    let mut project = env.load_project()?;
+    match args.sub.as_deref() {
+        Some("show") => {
+            println!("{}", serde_json::to_string_pretty(&json!({
+                "atlas": project.atlas, "building_scale": project.building_scale,
+                "settlement_moves": project.settlement_moves,
+            }))?);
+            return Ok(());
+        }
+        Some("proven") => {
+            project.atlas = Some(kgc_port_editor::atlas::Plan::proven());
+            project.building_scale = 0.5;
+        }
+        Some("off") => project.atlas = None,
+        Some("buildings") => {
+            anyhow::ensure!(args.options.contains_key("--building-scale"), "atlas buildings requires --building-scale");
+        }
+        other => bail!("Unknown atlas subcommand {other:?}; use show, proven, off or buildings"),
+    }
+    if let Some(value) = args.options.get("--building-scale") {
+        project.building_scale = value.parse().context("--building-scale must be a number")?;
+    }
+    project.validate_structure()?;
+    if env.workspace.join("sources/manifest.json").is_file() {
+        let snapshot = Snapshot::open(&env.workspace.join("sources"))?;
+        let (base, _) = map::region_source(&snapshot)?;
+        splits::replay(&base, &project)?;
+    }
+    project.save(env.project_path)?;
+    println!("Saved atlas/building settings to {}", env.project_path.display());
+    Ok(())
+}
+
+fn settlement(env: &Env<'_>, args: &Args) -> Result<()> {
+    let mut project = env.load_project()?;
+    match args.sub.as_deref() {
+        Some("list") => {
+            println!("{}", serde_json::to_string_pretty(&project.settlement_moves)?);
+            return Ok(());
+        }
+        Some("set") | Some("remove") => {
+            let region = args.required("--region")?;
+            let slot = args.required("--slot")?;
+            project.settlement_moves.retain(|movement| movement.region != region || movement.slot != slot);
+            if args.sub.as_deref() == Some("set") {
+                project.settlement_moves.push(kgc_port_editor::settlement::Move {
+                    region: region.into(), slot: slot.into(), position: parse_xy(args.required("--center")?)?,
+                });
+            }
+        }
+        other => bail!("Unknown settlement subcommand {other:?}; use list, set or remove"),
+    }
+    project.validate_structure()?;
+    let snapshot = Snapshot::open(&env.workspace.join("sources"))?;
+    let (base, _) = map::region_source(&snapshot)?;
+    splits::replay(&base, &project)?;
+    project.save(env.project_path)?;
+    println!("Saved settlement positions to {}", env.project_path.display());
+    Ok(())
+}
+
 fn theatre(env: &Env<'_>, args: &Args) -> Result<()> {
     anyhow::ensure!(args.sub.as_deref() == Some("list"), "Theatre bounds are fixed; only 'theatre list' is available");
     let snapshot = Snapshot::open(&env.workspace.join("sources"))?;
     let (mut data, _) = map::region_source(&snapshot)?;
-    kgc_port_editor::regionmap::chain::extend(&mut data)?;
+    let project = env.load_project()?;
+    kgc_port_editor::regionmap::chain::extend_for_project(&mut data, &project)?;
     for (key, [lo, hi]) in data.theatre_rects() {
-        println!("theatre {key}: ({}, {})..({}, {}) [fixed]", lo[0], lo[1], hi[0], hi[1]);
+        let rect = project.atlas.as_ref().map(|plan| plan.chart(&key).and_then(|chart| plan.camera_rect(chart, &key))).transpose()?.unwrap_or([lo, hi]);
+        println!("theatre {key}: ({}, {})..({}, {}) [fixed {}]", rect[0][0], rect[0][1], rect[1][0], rect[1][1], if project.atlas.is_some() { "atlas" } else { "source" });
     }
     Ok(())
 }
@@ -670,7 +754,7 @@ fn split(env: &Env<'_>, args: &Args) -> Result<()> {
             // replay the project's splits on the original geometry, then try the new cut
             let snapshot = Snapshot::open(&env.workspace.join("sources"))?;
             let (base, _) = map::region_source(&snapshot)?;
-            let (mut data, _) = splits::replay(&base, &project)?;
+            let (data, _) = splits::replay(&base, &project)?;
             let source_index = data.index(&split.source)?;
             if !splits::cuttable_areas(&data, source_index).contains(&split.area) {
                 bail!(
@@ -702,6 +786,7 @@ fn split(env: &Env<'_>, args: &Args) -> Result<()> {
             let key = split.key.clone();
             project.splits.push(split);
             splits::project_rules(&rules_root, &project)?;
+            splits::replay(&base, &project)?;
             project.save(env.project_path)?;
             println!("Added split {key}; saved {}", env.project_path.display());
             Ok(())
@@ -723,6 +808,7 @@ fn split(env: &Env<'_>, args: &Args) -> Result<()> {
             for key in &keys {
                 project.owners.remove(key);
             }
+            project.settlement_moves.retain(|movement| !keys.contains(&movement.region));
             splits::project_rules(&rules_root, &project)?;
             project.save(env.project_path)?;
             println!("Removed split(s) {}; saved {}", keys.join(", "), env.project_path.display());
@@ -815,7 +901,7 @@ fn tables(env: &Env<'_>, args: &Args, quiet: &(dyn Fn(&str) + Send + Sync)) -> R
             );
             if !spec.resources_reviewed {
                 eprintln!(
-                    "Resources not confirmed: `build` stays blocked until the folder is imported with --resources-reviewed."
+                    "Resources not confirmed: campaign/UI/script compatibility is unverified; this warning does not block export."
                 );
             }
             Ok(())
@@ -1179,6 +1265,20 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn optional_tables_flag_does_not_consume_following_import_options() {
+        let parsed = args(&[
+            "tables", "import", "--with-extras", "--folder", "input tables",
+            "--language", "en", "--pin",
+        ]).unwrap();
+        let spec = import_spec(&parsed).unwrap();
+        assert!(spec.extras);
+        assert!(parsed.flag("--pin"));
+        assert_eq!(spec.folder, PathBuf::from("input tables"));
+        assert_eq!(spec.language, "en");
+        assert!(args(&["tables", "import", "--with-extras", "--with-extras"]).is_err());
     }
 
     #[test]

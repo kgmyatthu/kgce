@@ -63,8 +63,25 @@ pub struct TheatreStep {
 /// Applies the fixed bounds before clipping; returns only changed theatres. Reject incompatible source lattices
 /// rather than silently changing the fixed policy. Reapplying the policy leaves rectangles and transitions alone.
 pub fn extend(rd: &mut RegionData) -> Result<Vec<TheatreChange>> {
+    extend_bounds(rd, FIXED_BOUNDS.iter().map(|(key, rect)| (*key, *rect)))
+}
+
+/// Atlas builds prepare the accepted source rectangles, not the wider legacy
+/// Western Plains canvas. Both GUI replay and export select this same policy.
+pub fn extend_for_project(rd: &mut RegionData, project: &crate::model::Project) -> Result<Vec<TheatreChange>> {
+    match &project.atlas {
+        Some(plan) => {
+            plan.validate()?;
+            extend_bounds(rd, plan.charts.iter().flat_map(|c| c.theatre_rects.iter())
+                .map(|(key, rect)| (key.as_str(), rect.map(|p| p.map(|v| v as f32)))))
+        }
+        None => extend(rd),
+    }
+}
+
+fn extend_bounds<'a>(rd: &mut RegionData, bounds: impl IntoIterator<Item = (&'a str, Rect)>) -> Result<Vec<TheatreChange>> {
     let mut changes = Vec::new();
-    for &(theatre, rect) in FIXED_BOUNDS {
+    for (theatre, rect) in bounds {
         let old = rd.theatre_rect(theatre)?;
         if old == rect {
             continue;

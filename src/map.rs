@@ -82,7 +82,7 @@ const SC_PREFIX_TO_CULTURE: [(&str, &str); 4] = [
     ("sc_indian", "indian"),
     ("sc_tribal", "tribal"),
 ];
-const TEMPLATE_SLOT_TYPES: [&str; 4] = [
+pub(crate) const TEMPLATE_SLOT_TYPES: [&str; 4] = [
     "port",
     "town-commercial",
     "town-industrial",
@@ -378,6 +378,23 @@ struct RegionReport {
     slots: Vec<SlotEntry>,
 }
 
+/// NTW's template-backed pick prisms use outward normals from CCW file polygons.
+/// ETW footprints are CW; legacy slots without a template still use the CW path.
+fn convert_slot_footprint(source: &Node, has_template: bool) -> Result<Node> {
+    let mut footprint = source.clone();
+    if has_template {
+        let Node::Value(esf::Value::Array { code: 0x4C, data }) = &mut footprint else {
+            bail!("slot footprint is not a packed XY array");
+        };
+        ensure!(data.len() % 8 == 0, "slot footprint contains an incomplete XY vertex");
+        let mut vertices = data.chunks_exact_mut(8);
+        while let (Some(first), Some(last)) = (vertices.next(), vertices.next_back()) {
+            first.swap_with_slice(last);
+        }
+    }
+    Ok(footprint)
+}
+
 /// Rewrite every region's `slot_descriptions` from the ETW v0 slot model to the NTW v1 model.
 fn convert_regions(
     root: &mut Node,
@@ -485,6 +502,7 @@ fn convert_regions(
                 };
             }
             let y = ((heights.get(&ntype).copied().unwrap_or(0.0)) * 1e6).round() / 1e6;
+            let has_template = !template.is_empty();
             new_items.push(vec![
                 esf::s16(nkey.clone()),
                 esf::s16(ntype.clone()),
@@ -493,9 +511,9 @@ fn convert_regions(
                 s[4].clone(),
                 s[5].clone(),
                 esf::s16(template),
-                s[6].clone(),
-                s[7].clone(),
-                s[8].clone(),
+                convert_slot_footprint(&s[6], has_template)?,
+                convert_slot_footprint(&s[7], has_template)?,
+                convert_slot_footprint(&s[8], has_template)?,
             ]);
             entries.push(SlotEntry {
                 etw_key: key,
@@ -984,6 +1002,7 @@ pub fn build(
     rules: &Rules,
     output_data: &Path,
     relief: &TerrainRelief,
+    extend_america: bool,
     progress: &Progress<'_>,
 ) -> Result<MapArtifacts> {
     let map_dir = output_data.join("campaign_maps").join("nap_world");
@@ -1024,6 +1043,7 @@ pub fn build(
         &region_keys.iter().cloned().collect(),
         relief,
         &art_cache,
+        extend_america,
         progress,
     )?;
     for r in &pa_rows {
@@ -1087,4 +1107,85 @@ fn write_file(path: &Path, data: &[u8]) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, data).with_context(|| format!("Write {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Napoleon's 0x909d00 prism builder uses (dz, -dx) for template-backed
+    // polygons, and negates it for legacy slots. 0x8fca30 accepts n.p + d <= 0.
+    fn pick_contains(slot: &[Node], polygon: usize, point: [f32; 2]) -> bool {
+        let points = slot[polygon].xy_array().unwrap();
+        if points.len() < 3 {
+            return false;
+        }
+        let sign = if slot[6].as_str().unwrap().is_empty() { -1.0 } else { 1.0 };
+        points.iter().zip(points.iter().cycle().skip(1)).all(|(a, b)| {
+            let normal = [(b[1] - a[1]) * sign, (a[0] - b[0]) * sign];
+            normal[0] * (point[0] - a[0]) + normal[1] * (point[1] - a[1]) <= 0.0
+        })
+    }
+
+    fn etw_slot(key: &str, kind: &str, sea: bool) -> Vec<Node> {
+        vec![
+            esf::s16(key),
+            esf::s16(kind),
+            esf::xyv(10.0, -2.0),
+            esf::xyv(10.0, 0.0),
+            Node::Value(esf::Value::Angle(0)),
+            Node::Value(esf::Value::Bool(false)),
+            esf::arr_xy(&[[9.0, -3.0], [9.0, -1.0], [11.0, -1.0], [11.0, -3.0]]),
+            esf::arr_xy(if sea { &[[9.0, -1.0], [9.0, 1.0], [11.0, 1.0], [11.0, -1.0]] } else { &[] }),
+            esf::arr_xy(&[[9.0, -3.0], [9.0, 1.0], [11.0, 1.0], [11.0, -3.0]]),
+        ]
+    }
+
+    #[test]
+    fn converted_ports_and_towns_have_pickable_prisms_without_breaking_legacy_slots() {
+        let mut root = Node::record("root", 0, vec![
+            Node::record("region_data", 0, vec![
+                Node::array("regions", 0, vec![vec![
+                    esf::s16("coast"),
+                    Node::record("settlement_and_slots", 0, vec![
+                        Node::array("slot_descriptions", 0, vec![
+                            etw_slot("settlement:coast:capital:settlement_road", "settlement_road", false),
+                            etw_slot("port:coast:harbour", "port", true),
+                            etw_slot("town:coast:works", "town-metal", false),
+                            etw_slot("wheat:coast:farm", "wheat", false),
+                        ]),
+                    ]),
+                ]]),
+            ]),
+        ]);
+        let types = json!({
+            "port:coast:harbour": "port",
+            "town:coast:works": "town-industrial",
+            "wheat:coast:farm": "wheat",
+        });
+        let templates = HashMap::from([
+            (("european".into(), "port".into()), "nap_eur_port".into()),
+            (("european".into(), "town-industrial".into()), "town_model".into()),
+        ]);
+        convert_regions(
+            &mut root,
+            types.as_object().unwrap(),
+            &BTreeMap::new(),
+            &templates,
+            &HashMap::from([("coast".into(), "european".into())]),
+        ).unwrap();
+        let region = &root.path(&["region_data", "regions"]).unwrap().items().unwrap()[0];
+        let slots = slot_array(region).unwrap().items().unwrap();
+        for slot in slots {
+            assert!(pick_contains(slot, 7, [10.0, -2.0]), "land footprint: {}", slot[0].as_str().unwrap());
+            assert!(pick_contains(slot, 9, [10.0, -2.0]), "selection hull: {}", slot[0].as_str().unwrap());
+            assert!(!pick_contains(slot, 9, [20.0, -2.0]));
+        }
+        let port = &slots[1];
+        assert!(pick_contains(port, 8, [10.0, 0.0]));
+        assert!(pick_contains(port, 9, [10.0, 0.0]));
+        assert!(!pick_contains(port, 7, [10.0, 0.0]));
+        assert!(!pick_contains(port, 8, [10.0, -2.0]));
+        assert!(!pick_contains(&slots[2], 8, [10.0, 0.0]));
+    }
 }

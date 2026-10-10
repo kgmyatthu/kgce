@@ -408,11 +408,36 @@ struct Entry {
     encoded: Vec<u8>,
 }
 
-/// Decodes every TSV; one problem per file that cannot be used, one per member provided twice.
-fn interpret(files: Vec<RawFile>, schema: &db::Schema, problems: &mut Vec<String>) -> Vec<Entry> {
+/// Table (lower case) a TSV file belongs to: its metadata row, else the table folder it sits in.
+fn file_table(f: &RawFile) -> Option<String> {
+    tsv::declared_table(&f.bytes).or_else(|| {
+        let rel = f.rel.replace('\\', "/");
+        let parts: Vec<&str> = rel.split('/').collect();
+        let parent = parts[parts.len().checked_sub(2)?].to_ascii_lowercase();
+        parent.ends_with("_tables").then_some(parent)
+    })
+}
+
+/// A database table the campaign conversion does not read. Its files can never decide an import.
+fn is_optional(table: Option<&str>, required: &BTreeSet<String>) -> bool {
+    table.is_some_and(|t| t.ends_with("_tables") && !required.contains(t))
+}
+
+/// Decodes every TSV. A file of a required table (or localisation) that cannot be used, and a required member provided
+/// twice, are problems. Files of tables the campaign does not read are never problems: an unreadable one, or a member
+/// provided twice, is left out of the dataset and reported in `notes`; the folder itself is not touched.
+fn interpret(
+    files: Vec<RawFile>,
+    schema: &db::Schema,
+    required: &BTreeSet<String>,
+    problems: &mut Vec<String>,
+    notes: &mut Vec<String>,
+) -> Vec<Entry> {
     let mut out: Vec<Entry> = Vec::with_capacity(files.len());
     let mut owner: HashMap<String, String> = HashMap::new();
+    let mut dropped: HashSet<String> = HashSet::new();
     for f in files {
+        let optional = is_optional(file_table(&f).as_deref(), required);
         let decoded = tsv::decode(&f.rel, &f.bytes, schema).and_then(|doc| match doc {
             Document::Db { member, table } => {
                 check_member(MemberKind::Db, &member).with_context(|| f.rel.clone())?;
@@ -440,16 +465,35 @@ fn interpret(files: Vec<RawFile>, schema: &db::Schema, problems: &mut Vec<String
         });
         let (kind, member, rows, encoded) = match decoded {
             Ok(v) => v,
+            Err(e) if optional => {
+                notes.push(format!(
+                    "{} is not imported: it belongs to a table the campaign does not read and cannot be decoded ({e:#})",
+                    f.rel
+                ));
+                continue;
+            }
             Err(e) => {
                 problems.push(format!("{e:#}"));
                 continue;
             }
         };
+        if dropped.contains(&member) {
+            continue;
+        }
         if let Some(first) = owner.insert(member.clone(), f.rel.clone()) {
-            problems.push(format!(
-                "{first} and {} both provide {member}; export each table member only once",
-                f.rel
-            ));
+            if optional {
+                out.retain(|e| e.member != member);
+                dropped.insert(member.clone());
+                notes.push(format!(
+                    "{first} and {} both provide {member}, a table the campaign does not read; neither is imported",
+                    f.rel
+                ));
+            } else {
+                problems.push(format!(
+                    "{first} and {} both provide {member}; export each table member only once",
+                    f.rel
+                ));
+            }
             continue;
         }
         out.push(Entry {
@@ -574,7 +618,17 @@ fn analyze(
             }
             preview.files = tree.files.len();
             progress(&format!("Decoding {} TSV files", tree.files.len()));
-            entries = interpret(tree.files, &schema, &mut preview.problems);
+            let required: BTreeSet<String> = preview
+                .required
+                .iter()
+                .map(|r| r.table.to_lowercase())
+                .collect();
+            let mut unreadable: Vec<String> = Vec::new();
+            entries = interpret(tree.files, &schema, &required, &mut preview.problems, &mut unreadable);
+            for note in unreadable {
+                notes.push(note.clone());
+                preview.warnings.push(note);
+            }
             if !spec.extras {
                 let ignored = keep_required(&mut entries, &preview.required);
                 if !ignored.is_empty() {
@@ -610,7 +664,7 @@ fn analyze(
     }
     if !spec.resources_reviewed {
         preview.warnings.push(
-            "resources are not confirmed: TSV files carry no campaign, UI or script data; confirm that resources you do not supply as an adapter use the original conversion templates, otherwise export stays blocked".into(),
+            "resources are not confirmed: TSV files carry no campaign, UI or script data; resources you do not supply as an adapter use the original conversion templates. This does not block the export".into(),
         );
     }
     preview.problems.sort();

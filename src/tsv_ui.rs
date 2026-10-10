@@ -487,7 +487,7 @@ impl TsvUi {
                             if info.resources_reviewed {
                                 ui.colored_label(GREEN, "Resource limits reviewed at import.");
                             } else {
-                                ui.colored_label(RED, "Resource limits were NOT confirmed at import: export is blocked. Import the folder again with the confirmation ticked.");
+                                ui.colored_label(AMBER, "Resource limits were not acknowledged at import. This does not block export; resources you do not supply use the original templates.");
                             }
                         }
                         Some(Err(error)) => {
@@ -611,7 +611,7 @@ impl TsvUi {
         if !self.resources_reviewed {
             ui.colored_label(
                 AMBER,
-                "Without this confirmation the dataset can be imported but exporting a ZIP stays blocked.",
+                "Optional: it does not block importing or exporting; resources not provided separately use the original templates.",
             );
         }
         if let Some(notice) = &self.notice {
@@ -1383,11 +1383,11 @@ impl TsvUi {
                 match &self.info {
                     Some(Ok(info)) if info.binding == *binding => gate(
                         ui,
-                        info.resources_reviewed,
+                        true,
                         if info.resources_reviewed {
                             "Resource limits reviewed (original templates apply to anything not supplied)".into()
                         } else {
-                            "Resource review not confirmed: import the folder again with the confirmation".into()
+                            "Resource limits not acknowledged (advisory; original templates apply to anything not supplied)".into()
                         },
                     ),
                     Some(Err(error)) => {
